@@ -8,7 +8,12 @@ Combines:
 """
 
 from typing import TypedDict, List, Dict, Any, Optional, AsyncIterator
-from langgraph.graph import StateGraph, START, END
+try:
+    from langgraph.graph import StateGraph, START, END
+except ImportError:
+    from langgraph.graph import StateGraph
+    START = "__start__"
+    END = "__end__"
 from langchain_openai import ChatOpenAI
 from langchain.schema import HumanMessage, SystemMessage, AIMessage
 import numpy as np

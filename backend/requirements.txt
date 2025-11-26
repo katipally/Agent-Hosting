@@ -10,6 +10,9 @@ langgraph==0.0.40
 langchain-openai==0.0.8
 sentence-transformers==2.2.2
 
+# Pin huggingface-hub to a version that still exposes cached_download
+huggingface-hub==0.24.6
+
 # Transformer stack (used by sentence-transformers and related models)
 transformers==4.38.2
 #torch==2.2.1
