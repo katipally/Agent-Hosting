@@ -112,14 +112,22 @@ SESSION_TTL_SECONDS = 60 * 60 * 24 * 7
 
 
 def _cookie_settings() -> Dict[str, Any]:
-    secure = not (
+    is_local = (
         Config.FRONTEND_BASE_URL.startswith("http://localhost")
         or Config.FRONTEND_BASE_URL.startswith("http://127.0.0.1")
     )
+
+    if is_local:
+        return {
+            "httponly": True,
+            "secure": False,
+            "samesite": "lax",
+        }
+
     return {
         "httponly": True,
-        "secure": secure,
-        "samesite": "lax",
+        "secure": True,
+        "samesite": "none",
     }
 
 
