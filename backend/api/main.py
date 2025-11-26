@@ -736,6 +736,8 @@ _frontend_origins = ["http://localhost:5173", "http://localhost:3000"]
 if Config.FRONTEND_BASE_URL and Config.FRONTEND_BASE_URL not in _frontend_origins:
     _frontend_origins.append(Config.FRONTEND_BASE_URL)
 
+logger.info("Configured CORS allowed origins: %s", _frontend_origins)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_frontend_origins,
