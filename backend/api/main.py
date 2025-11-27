@@ -119,12 +119,14 @@ def _cookie_settings() -> Dict[str, Any]:
 
     if is_local:
         return {
+            "path": "/",
             "httponly": True,
             "secure": False,
             "samesite": "lax",
         }
 
     return {
+        "path": "/",
         "httponly": True,
         "secure": True,
         "samesite": "none",
@@ -715,7 +717,7 @@ async def logout(request: Request):
         _delete_app_session(session_id)
 
     response = JSONResponse({"detail": "logged_out"})
-    response.delete_cookie(SESSION_COOKIE_NAME)
+    response.delete_cookie(SESSION_COOKIE_NAME, path="/")
     return response
 
 
