@@ -60,11 +60,29 @@ interface NotionPage {
   children?: NotionPage[]
 }
 
+interface DatabaseEntry {
+  id: string
+  title: string
+  properties: Record<string, any>
+}
+
+interface DatabaseData {
+  database_id?: string
+  title?: string
+  columns?: string[]
+  entries?: DatabaseEntry[]
+  total?: number
+  error?: string
+}
+
 interface NotionPageContentState {
   content?: string
   attachments?: { id?: string; type: string; name?: string; url?: string | null }[]
   loading?: boolean
   error?: string | null
+  isDatabase?: boolean
+  database?: DatabaseData
+  childDatabases?: DatabaseData[]
 }
 
 type PipelineSource = 'slack' | 'gmail' | 'notion'
@@ -80,7 +98,10 @@ export default function PipelinesInterface() {
   const [slackRunStatus, setSlackRunStatus] = useState<string | null>(null)
   const [slackIsRunning, setSlackIsRunning] = useState(false)
   const [slackMessages, setSlackMessages] = useState<SlackMessage[]>([])
+  // Channel list search
   const [slackSearchQuery, setSlackSearchQuery] = useState('')
+  // Messages pane search (independent from channel search)
+  const [slackMessageSearchQuery, setSlackMessageSearchQuery] = useState('')
   const [slackLastRunAt, setSlackLastRunAt] = useState<string | null>(null)
 
   // Gmail state
@@ -90,6 +111,7 @@ export default function PipelinesInterface() {
   const [gmailRunStatus, setGmailRunStatus] = useState<string | null>(null)
   const [gmailIsRunning, setGmailIsRunning] = useState(false)
   const [gmailMessages, setGmailMessages] = useState<GmailMessage[]>([])
+  const [gmailSearchQuery, setGmailSearchQuery] = useState('')
   const [gmailLastRunAt, setGmailLastRunAt] = useState<string | null>(null)
 
   // Notion state
@@ -130,6 +152,12 @@ export default function PipelinesInterface() {
       if (typeof stored.slackSearchQuery === 'string') {
         setSlackSearchQuery(stored.slackSearchQuery)
       }
+      if (typeof stored.slackMessageSearchQuery === 'string') {
+        setSlackMessageSearchQuery(stored.slackMessageSearchQuery)
+      }
+      if (typeof stored.gmailSearchQuery === 'string') {
+        setGmailSearchQuery(stored.gmailSearchQuery)
+      }
       if (typeof stored.notionSearchQuery === 'string') {
         setNotionSearchQuery(stored.notionSearchQuery)
       }
@@ -156,6 +184,8 @@ export default function PipelinesInterface() {
         selectedChannelId,
         selectedLabelId,
         slackSearchQuery,
+        slackMessageSearchQuery,
+        gmailSearchQuery,
         notionSearchQuery,
         slackLastRunAt,
         gmailLastRunAt,
@@ -165,7 +195,18 @@ export default function PipelinesInterface() {
     } catch (err) {
       console.error('Failed to persist pipelines UI state', err)
     }
-  }, [activeSource, selectedChannelId, selectedLabelId, slackSearchQuery, notionSearchQuery, slackLastRunAt, gmailLastRunAt, notionLastRunAt])
+  }, [
+    activeSource,
+    selectedChannelId,
+    selectedLabelId,
+    slackSearchQuery,
+    slackMessageSearchQuery,
+    gmailSearchQuery,
+    notionSearchQuery,
+    slackLastRunAt,
+    gmailLastRunAt,
+    notionLastRunAt,
+  ])
 
   // -----------------------------
   // Slack helpers
@@ -296,14 +337,32 @@ export default function PipelinesInterface() {
 
   const selectedChannel = channels.find((ch) => ch.channel_id === selectedChannelId) || null
 
+  // Slack channel search (left column)
+  const slackChannelSearch = slackSearchQuery.trim().toLowerCase()
+  const filteredChannels = slackChannelSearch
+    ? channels.filter((ch) => {
+        const name = (ch.name || ch.channel_id || '').toLowerCase()
+        return name.includes(slackChannelSearch)
+      })
+    : channels
+
+  // Slack message search (right column) - independent from channel search
+  const slackMessageSearch = slackMessageSearchQuery.trim().toLowerCase()
+  const filteredSlackMessages = slackMessageSearch
+    ? slackMessages.filter((msg) => {
+        const parts = [msg.user_name, msg.user_id, msg.text]
+        const haystack = parts
+          .filter((p) => p && p !== '')
+          .join(' ')
+          .toLowerCase()
+        return haystack.includes(slackMessageSearch)
+      })
+    : slackMessages
+
   const groupedSlackThreads = (() => {
     const threads: Record<string, { root: SlackMessage | null; replies: SlackMessage[] }> = {}
-    const sortedMessages = [...slackMessages].sort((a, b) => a.timestamp - b.timestamp)
-    const search = slackSearchQuery.trim().toLowerCase()
+    const sortedMessages = [...filteredSlackMessages].sort((a, b) => a.timestamp - b.timestamp)
     for (const msg of sortedMessages) {
-      if (search && !(msg.text || '').toLowerCase().includes(search)) {
-        continue
-      }
       const key = msg.thread_ts != null ? String(msg.thread_ts) : String(msg.timestamp)
       if (!threads[key]) {
         threads[key] = { root: null, replies: [] }
@@ -551,14 +610,29 @@ export default function PipelinesInterface() {
   }
 
   // -----------------------------
-  // Initial data
+  // Initial data - load only active source for speed
   // -----------------------------
 
+  // Track which sources have been loaded to avoid re-fetching
+  const [loadedSources, setLoadedSources] = useState<Set<PipelineSource>>(() => new Set())
+
   useEffect(() => {
-    fetchSlackData()
-    fetchGmailLabels()
-    fetchNotionHierarchy()
-  }, [])
+    // Only load data for the active source if not already loaded
+    if (loadedSources.has(activeSource)) return
+
+    const loadData = async () => {
+      if (activeSource === 'slack') {
+        await fetchSlackData()
+      } else if (activeSource === 'gmail') {
+        await fetchGmailLabels()
+      } else if (activeSource === 'notion') {
+        await fetchNotionHierarchy()
+      }
+      setLoadedSources((prev) => new Set([...prev, activeSource]))
+    }
+
+    loadData()
+  }, [activeSource, loadedSources])
 
   useEffect(() => {
     if (!selectedLabelId) {
@@ -626,7 +700,7 @@ export default function PipelinesInterface() {
 
     try {
       const response = await fetch(
-        `${API_BASE_URL}/api/notion/page-content?page_id=${encodeURIComponent(pageId)}`,
+        `${API_BASE_URL}/api/notion/page-content?page_id=${encodeURIComponent(pageId)}&include_databases=true`,
         {
           credentials: 'include',
         },
@@ -642,6 +716,9 @@ export default function PipelinesInterface() {
           attachments: data.attachments || [],
           loading: false,
           error: null,
+          isDatabase: data.is_database || false,
+          database: data.database || null,
+          childDatabases: data.child_databases || [],
         },
       }))
     } catch (err: any) {
@@ -735,16 +812,29 @@ export default function PipelinesInterface() {
       <div className="flex-1 p-4 overflow-hidden flex flex-col">
         <h2 className="text-lg font-semibold mb-3">Slack Channels</h2>
         <div className="flex-1 flex overflow-hidden gap-4">
-          <div className="w-80 border border-border rounded-md bg-card overflow-auto">
-            <table className="min-w-full text-xs">
-              <thead className="bg-muted">
-                <tr>
-                  <th className="px-3 py-2 text-left font-medium text-muted-foreground">Channel</th>
-                  <th className="px-3 py-2 text-right font-medium text-muted-foreground">Messages</th>
-                </tr>
-              </thead>
-              <tbody>
-                {channels.map((ch) => (
+          <div className="w-80 border border-border rounded-md bg-card flex flex-col">
+            <div className="p-2 border-b border-border flex items-center gap-2">
+              <input
+                type="text"
+                value={slackSearchQuery}
+                onChange={(e) => setSlackSearchQuery(e.target.value)}
+                placeholder="Search channels and messages"
+                className="flex-1 rounded-md border border-border bg-background px-2 py-1 text-xs"
+              />
+              <span className="text-[11px] text-muted-foreground whitespace-nowrap">
+                {filteredChannels.length} channels
+              </span>
+            </div>
+            <div className="flex-1 overflow-auto">
+              <table className="min-w-full text-xs">
+                <thead className="bg-muted">
+                  <tr>
+                    <th className="px-3 py-2 text-left font-medium text-muted-foreground">Channel</th>
+                    <th className="px-3 py-2 text-right font-medium text-muted-foreground">Messages</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredChannels.map((ch) => (
                   <tr
                     key={ch.channel_id}
                     className={
@@ -773,15 +863,16 @@ export default function PipelinesInterface() {
                     <td className="px-3 py-2 text-right align-top text-xs">{ch.message_count}</td>
                   </tr>
                 ))}
-                {channels.length === 0 && (
+                {filteredChannels.length === 0 && (
                   <tr>
                     <td colSpan={2} className="px-3 py-4 text-center text-xs text-muted-foreground">
-                      No Slack channels found yet. Run the Slack pipeline to load data.
+                      No Slack channels match this search.
                     </td>
                   </tr>
                 )}
               </tbody>
             </table>
+            </div>
           </div>
 
           <div
@@ -812,7 +903,7 @@ export default function PipelinesInterface() {
                   </p>
                 </div>
 
-                <div className="flex-1 overflow-auto border border-border rounded-md bg-background p-2">
+                <div className="flex-1 border border-border rounded-md bg-background p-2 flex flex-col">
                   {slackMessages.length === 0 ? (
                     <p className="text-xs text-muted-foreground">
                       No messages loaded for this channel yet. Run the Slack pipeline or select the
@@ -823,16 +914,16 @@ export default function PipelinesInterface() {
                       <div className="mb-2 flex items-center justify-between gap-2">
                         <input
                           type="text"
-                          value={slackSearchQuery}
-                          onChange={(e) => setSlackSearchQuery(e.target.value)}
-                          placeholder="Filter messages"
+                          value={slackMessageSearchQuery}
+                          onChange={(e) => setSlackMessageSearchQuery(e.target.value)}
+                          placeholder="Filter by text or user"
                           className="flex-1 rounded-md border border-border bg-background px-2 py-1 text-xs"
                         />
-                        <span className="text-[11px] text-muted-foreground">
-                          {slackMessages.length} loaded
+                        <span className="text-[11px] text-muted-foreground whitespace-nowrap">
+                          {filteredSlackMessages.length} shown / {slackMessages.length} loaded
                         </span>
                       </div>
-                      <div className="space-y-3">
+                      <div className="flex-1 overflow-auto space-y-3">
                         {Object.entries(groupedSlackThreads).map(([key, thread]) => (
                           <div key={key} className="rounded-md border border-border/60 bg-card p-2">
                             {thread.root && (
@@ -902,9 +993,31 @@ export default function PipelinesInterface() {
     </>
   )
 
-  const renderGmailView = () => (
-    <>
-      <div className="w-80 border-r border-border bg-card p-4 flex flex-col gap-4">
+  const renderGmailView = () => {
+    const search = gmailSearchQuery.trim().toLowerCase()
+    const filteredMessages = search
+      ? gmailMessages.filter((msg) => {
+          const parts = [
+            msg.from,
+            msg.to,
+            msg.cc,
+            msg.bcc,
+            msg.subject,
+            msg.snippet,
+            msg.body_text,
+            msg.body_html,
+          ]
+          const haystack = parts
+            .filter((p) => p && p !== '')
+            .join(' ')
+            .toLowerCase()
+          return haystack.includes(search)
+        })
+      : gmailMessages
+
+    return (
+      <>
+        <div className="w-80 border-r border-border bg-card p-4 flex flex-col gap-4">
         <div>
           <h2 className="text-lg font-semibold mb-2">Gmail Pipeline</h2>
           <p className="text-sm text-muted-foreground mb-3">
@@ -977,64 +1090,88 @@ export default function PipelinesInterface() {
               No messages loaded yet. Select a label and run the Gmail pipeline.
             </p>
           ) : (
-            <div className="space-y-2">
-              {[...gmailMessages]
-                .sort((a, b) => {
-                  const aTime = a.date ? new Date(a.date).getTime() : 0
-                  const bTime = b.date ? new Date(b.date).getTime() : 0
-                  return aTime - bTime
-                })
-                .map((msg, index, arr) => {
-                  const recipients = msg.to || msg.cc || msg.bcc
-                  const header = recipients
-                    ? `${msg.from || 'Unknown sender'} -> ${recipients} · ${msg.subject || 'No subject'}`
-                    : `${msg.from || 'Unknown sender'} · ${msg.subject || 'No subject'}`
-                  const dateStr = msg.date ? new Date(msg.date).toLocaleString() : 'Unknown date'
-                  const body = msg.body_html || msg.body_text || msg.snippet || '[no content]'
-                  const isLatest = index === arr.length - 1
-                  const gmailUrl = msg.id ? `https://mail.google.com/mail/u/0/#all/${msg.id}` : null
-                  return (
-                    <details
-                      key={msg.id}
-                      open={isLatest}
-                      className="rounded-md border border-border/60 bg-background open:bg-card"
-                    >
-                      <summary className="cursor-pointer px-3 py-2 text-xs flex flex-col gap-0.5">
-                        <span className="font-medium text-foreground truncate">{header}</span>
-                        <span className="text-[11px] text-muted-foreground">{dateStr}</span>
-                      </summary>
-                      <div className="px-3 py-2 border-t border-border/40 text-xs text-foreground">
-                        {gmailUrl && (
-                          <div className="mb-2 flex items-center justify-between gap-2">
-                            <span className="text-[11px] text-muted-foreground break-all">ID: {msg.id}</span>
-                            <button
-                              type="button"
-                              onClick={() => window.open(gmailUrl, '_blank')}
-                              className="text-[11px] font-medium text-blue-400 hover:underline"
-                            >
-                              Open in Gmail
-                            </button>
+            <>
+              <div className="mb-2 flex items-center justify-between gap-2">
+                <input
+                  type="text"
+                  value={gmailSearchQuery}
+                  onChange={(e) => setGmailSearchQuery(e.target.value)}
+                  placeholder="Filter by sender, subject, recipients, or body"
+                  className="flex-1 rounded-md border border-border bg-background px-2 py-1 text-xs"
+                />
+                <span className="text-[11px] text-muted-foreground whitespace-nowrap">
+                  {filteredMessages.length} shown / {gmailMessages.length} loaded
+                </span>
+              </div>
+
+              {filteredMessages.length === 0 ? (
+                <p className="text-xs text-muted-foreground">
+                  No messages match this search.
+                </p>
+              ) : (
+                <div className="space-y-2">
+                  {[...filteredMessages]
+                    .sort((a, b) => {
+                      const aTime = a.date ? new Date(a.date).getTime() : 0
+                      const bTime = b.date ? new Date(b.date).getTime() : 0
+                      return aTime - bTime
+                    })
+                    .map((msg, index, arr) => {
+                      const recipients = msg.to || msg.cc || msg.bcc
+                      const header = recipients
+                        ? `${msg.from || 'Unknown sender'} -> ${recipients} · ${
+                            msg.subject || 'No subject'
+                          }`
+                        : `${msg.from || 'Unknown sender'} · ${msg.subject || 'No subject'}`
+                      const dateStr = msg.date ? new Date(msg.date).toLocaleString() : 'Unknown date'
+                      const body = msg.body_html || msg.body_text || msg.snippet || '[no content]'
+                      const isLatest = index === arr.length - 1
+                      const gmailUrl = msg.id ? `https://mail.google.com/mail/u/0/#all/${msg.id}` : null
+                      return (
+                        <details
+                          key={msg.id}
+                          open={isLatest}
+                          className="rounded-md border border-border/60 bg-background open:bg-card"
+                        >
+                          <summary className="cursor-pointer px-3 py-2 text-xs flex flex-col gap-0.5">
+                            <span className="font-medium text-foreground truncate">{header}</span>
+                            <span className="text-[11px] text-muted-foreground">{dateStr}</span>
+                          </summary>
+                          <div className="px-3 py-2 border-t border-border/40 text-xs text-foreground">
+                            {gmailUrl && (
+                              <div className="mb-2 flex items-center justify-between gap-2">
+                                <span className="text-[11px] text-muted-foreground break-all">ID: {msg.id}</span>
+                                <button
+                                  type="button"
+                                  onClick={() => window.open(gmailUrl, '_blank')}
+                                  className="text-[11px] font-medium text-blue-400 hover:underline"
+                                >
+                                  Open in Gmail
+                                </button>
+                              </div>
+                            )}
+                            {msg.body_html ? (
+                              <div
+                                className="prose prose-invert max-w-none text-xs"
+                                dangerouslySetInnerHTML={{ __html: msg.body_html }}
+                              />
+                            ) : (
+                              <pre className="whitespace-pre-wrap text-xs text-foreground">{body}</pre>
+                            )}
                           </div>
-                        )}
-                        {msg.body_html ? (
-                          <div
-                            className="prose prose-invert max-w-none text-xs"
-                            dangerouslySetInnerHTML={{ __html: msg.body_html }}
-                          />
-                        ) : (
-                          <pre className="whitespace-pre-wrap text-xs text-foreground">{body}</pre>
-                        )}
-                      </div>
-                    </details>
-                  )
-                })}
-              <div ref={gmailMessagesEndRef} />
-            </div>
+                        </details>
+                      )
+                    })}
+                  <div ref={gmailMessagesEndRef} />
+                </div>
+              )}
+            </>
           )}
         </div>
       </div>
     </>
   )
+  }
 
   const renderNotionTreeNode = (page: NotionPage, depth = 0) => {
     const lastEdited = page.last_edited_time
@@ -1085,7 +1222,8 @@ export default function PipelinesInterface() {
               </button>
             </div>
           )}
-          {hasProps && (
+          {/* Only show Properties for regular pages, not for databases */}
+          {hasProps && !contentState?.isDatabase && (
             <div>
               <div className="text-[11px] font-semibold text-muted-foreground mb-0.5">Properties</div>
               <dl className="space-y-0.5">
@@ -1106,7 +1244,119 @@ export default function PipelinesInterface() {
           {!contentState?.loading && contentState?.error && (
             <p className="text-[11px] text-red-400">Failed to load content: {contentState.error}</p>
           )}
-          {!contentState?.loading && contentState?.content && (
+          {/* Show database content as table */}
+          {!contentState?.loading && contentState?.isDatabase && contentState?.database && (
+            <div>
+              <div className="text-[11px] font-semibold text-muted-foreground mb-1">
+                📊 Database: {contentState.database.title || 'Untitled'} ({contentState.database.total || 0} entries)
+              </div>
+              {contentState.database.error && (
+                <p className="text-[10px] text-amber-500 mb-1">{contentState.database.error}</p>
+              )}
+              {(contentState.database.entries?.length || 0) > 0 ? (
+                <div className="max-h-80 overflow-auto border border-border/40 rounded-md bg-background/40">
+                  <table className="w-full text-[10px]">
+                    <thead className="bg-muted/50 sticky top-0">
+                      <tr>
+                        {(contentState.database.columns || []).map((col) => (
+                          <th key={col} className="px-2 py-1 text-left font-medium text-muted-foreground border-b border-border/40 whitespace-nowrap">
+                            {col}
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {(contentState.database.entries || []).map((entry) => (
+                        <tr key={entry.id} className="border-b border-border/20 hover:bg-muted/20">
+                          {(contentState.database?.columns || []).map((col) => {
+                            const val = entry.properties?.[col]
+                            let displayVal = '-'
+                            if (val !== null && val !== undefined && val !== '') {
+                              if (Array.isArray(val)) {
+                                displayVal = val.slice(0, 3).join(', ') + (val.length > 3 ? '...' : '')
+                              } else if (typeof val === 'number') {
+                                displayVal = val >= 1000 ? `$${val.toLocaleString()}` : String(val)
+                              } else {
+                                displayVal = String(val).slice(0, 80) + (String(val).length > 80 ? '...' : '')
+                              }
+                            }
+                            return (
+                              <td key={col} className="px-2 py-1 text-foreground whitespace-nowrap">
+                                {displayVal}
+                              </td>
+                            )
+                          })}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <p className="text-[10px] text-muted-foreground">
+                  No entries found. This may be a linked database view - ensure the original database is shared with the Notion integration.
+                </p>
+              )}
+            </div>
+          )}
+          {/* Show child databases */}
+          {!contentState?.loading && contentState?.childDatabases && contentState.childDatabases.length > 0 && (
+            <div className="space-y-2">
+              {contentState.childDatabases.map((db) => (
+                <div key={db.database_id || db.title}>
+                  <div className="text-[11px] font-semibold text-muted-foreground mb-1">
+                    📊 {db.title || 'Database'} ({db.total || 0} entries)
+                  </div>
+                  {db.error && (
+                    <p className="text-[10px] text-amber-500 mb-1">{db.error}</p>
+                  )}
+                  {(db.entries?.length || 0) > 0 ? (
+                    <div className="max-h-64 overflow-auto border border-border/40 rounded-md bg-background/40">
+                      <table className="w-full text-[10px]">
+                        <thead className="bg-muted/50 sticky top-0">
+                          <tr>
+                            {(db.columns || []).map((col) => (
+                              <th key={col} className="px-2 py-1 text-left font-medium text-muted-foreground border-b border-border/40 whitespace-nowrap">
+                                {col}
+                              </th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {(db.entries || []).map((entry) => (
+                            <tr key={entry.id} className="border-b border-border/20 hover:bg-muted/20">
+                              {(db.columns || []).map((col) => {
+                                const val = entry.properties?.[col]
+                                let displayVal = '-'
+                                if (val !== null && val !== undefined && val !== '') {
+                                  if (Array.isArray(val)) {
+                                    displayVal = val.slice(0, 2).join(', ') + (val.length > 2 ? '...' : '')
+                                  } else if (typeof val === 'number') {
+                                    displayVal = val >= 1000 ? `$${val.toLocaleString()}` : String(val)
+                                  } else {
+                                    displayVal = String(val).slice(0, 60) + (String(val).length > 60 ? '...' : '')
+                                  }
+                                }
+                                return (
+                                  <td key={col} className="px-2 py-1 text-foreground whitespace-nowrap">
+                                    {displayVal}
+                                  </td>
+                                )
+                              })}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  ) : (
+                    <p className="text-[10px] text-muted-foreground">
+                      No entries found. This may be a linked database - ensure the original is shared with the integration.
+                    </p>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+          {!contentState?.loading && contentState?.content && !contentState?.isDatabase && (
             <div>
               <div className="text-[11px] font-semibold text-muted-foreground mb-0.5">Page content</div>
               <pre className="whitespace-pre-wrap text-[11px] text-foreground max-h-48 overflow-auto border border-border/40 rounded-md p-1.5 bg-background/40">

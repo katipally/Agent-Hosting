@@ -921,6 +921,7 @@ class HybridRAGEngine:
         query: str,
         top_k: int = 5,
         gmail_account_email: Optional[str] = None,
+        sources: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Hybrid retrieval with reranking.
         
@@ -946,6 +947,11 @@ class HybridRAGEngine:
             limit=20,
             gmail_account_email=gmail_account_email,
         )
+
+        if sources:
+            allowed = set(sources)
+            vector_results = [r for r in vector_results if r.get('type') in allowed]
+            keyword_results = [r for r in keyword_results if r.get('type') in allowed]
         
         # Step 3: RRF fusion
         fused_results = self._rrf_fusion(vector_results, keyword_results)

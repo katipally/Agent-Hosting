@@ -354,9 +354,6 @@ export default function CalendarInterface() {
             const isToday = key === todayKey
             const isSelectedDay = key === selectedKey
 
-            const weekday = day.getDay()
-            const isWeekend = weekday === 0 || weekday === 6
-
             const sortedEvents = [...list].sort((a, b) => {
               const sa = parseEventDate(a.start)?.getTime() ?? 0
               const sb = parseEventDate(b.start)?.getTime() ?? 0
@@ -373,9 +370,7 @@ export default function CalendarInterface() {
                       ? 'border border-blue-500 bg-blue-50/80'
                       : isSelectedDay
                         ? 'border border-blue-400 bg-blue-50/40'
-                        : isWeekend
-                          ? 'border bg-muted/60 border-border'
-                          : 'border bg-card border-border'
+                        : 'border bg-card border-border'
                 }`}
               >
                 <header className="px-1 py-0.5 flex items-center justify-between">

@@ -46,10 +46,10 @@ interface SlackChannelOption {
 
 const INTERVAL_OPTIONS: { value: number; label: string }[] = [
   { value: 30, label: '30 seconds' },
-  { value: 60, label: '1 minute' },
-  { value: 300, label: '5 minutes' },
-  { value: 600, label: '10 minutes' },
   { value: 3600, label: '1 hour' },
+  { value: 10800, label: '3 hours' },
+  { value: 28800, label: '8 hours' },
+  { value: 86400, label: '24 hours' },
 ]
 
 export default function WorkflowsInterface() {
@@ -66,6 +66,7 @@ export default function WorkflowsInterface() {
   const [lastRunStats, setLastRunStats] = useState<RunOnceStats | null>(null)
 
   const [remainingSeconds, setRemainingSeconds] = useState<number | null>(null)
+  const [pendingInterval, setPendingInterval] = useState<number | null>(null)
 
   const selectedWorkflow =
     workflows.find((w) => w.id === selectedWorkflowId) || (workflows.length > 0 ? workflows[0] : null)
@@ -134,10 +135,18 @@ export default function WorkflowsInterface() {
     }
   }
 
+  // Track if Slack channels have been loaded (for "add channel" dropdown)
+  const [slackChannelsLoaded, setSlackChannelsLoaded] = useState(false)
+
   useEffect(() => {
     loadWorkflows()
-    loadSlackChannels()
   }, [])
+
+  // Lazy-load Slack channels only when a workflow is selected (user might add channels)
+  useEffect(() => {
+    if (!selectedWorkflowId || slackChannelsLoaded) return
+    loadSlackChannels().then(() => setSlackChannelsLoaded(true))
+  }, [selectedWorkflowId, slackChannelsLoaded])
 
   useEffect(() => {
     const hasActive = workflows.some((w) => w.status === 'active')
@@ -214,7 +223,7 @@ export default function WorkflowsInterface() {
           name,
           type: 'slack_to_notion',
           notion_master_page_id: masterPageId,
-          poll_interval_seconds: 30,
+          poll_interval_seconds: 3600,
         }),
       })
       if (!res.ok) {
@@ -231,24 +240,31 @@ export default function WorkflowsInterface() {
     }
   }
 
-  const handleUpdateInterval = async (workflow: Workflow, newInterval: number) => {
+  const handleSaveInterval = async () => {
+    if (!selectedWorkflow || pendingInterval === null) return
+    
     try {
       setError(null)
-      const res = await fetch(`${API_BASE_URL}/api/workflows/${workflow.id}`, {
+      const res = await fetch(`${API_BASE_URL}/api/workflows/${selectedWorkflow.id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
-        body: JSON.stringify({ poll_interval_seconds: newInterval }),
+        body: JSON.stringify({ poll_interval_seconds: pendingInterval }),
       })
       if (!res.ok) {
         throw new Error(`Failed to update interval: ${res.status}`)
       }
       const updated = (await res.json()) as Workflow
       setWorkflows((prev) => prev.map((w) => (w.id === updated.id ? updated : w)))
+      setPendingInterval(null)
     } catch (e: any) {
       console.error('Error updating workflow interval', e)
       setError(e.message || 'Failed to update workflow interval')
     }
+  }
+
+  const handleCancelInterval = () => {
+    setPendingInterval(null)
   }
 
   const handleRunOnce = async (workflow: Workflow) => {
@@ -331,10 +347,19 @@ export default function WorkflowsInterface() {
   const formatRemaining = (value: number | null): string => {
     if (value == null) return '—'
     if (value <= 0) return 'due now'
-    const m = Math.floor(value / 60)
+    const h = Math.floor(value / 3600)
+    const m = Math.floor((value % 3600) / 60)
     const s = value % 60
-    if (m <= 0) return `${s}s`
-    return `${m}m ${s.toString().padStart(2, '0')}s`
+
+    const parts: string[] = []
+    if (h > 0) {
+      parts.push(`${h}hr${h === 1 ? '' : 's'}`)
+    }
+    if (m > 0 || h > 0) {
+      parts.push(`${m}min${m === 1 ? '' : 's'}`)
+    }
+    parts.push(`${s}sec`)
+    return parts.join(' ')
   }
 
   return (
@@ -448,10 +473,8 @@ export default function WorkflowsInterface() {
                     <select
                       className="text-[11px] rounded-md border border-border bg-background px-1.5 py-0.5"
                       aria-label="Workflow interval"
-                      value={selectedWorkflow.poll_interval_seconds || 30}
-                      onChange={(e) =>
-                        handleUpdateInterval(selectedWorkflow, Number(e.target.value) || 30)
-                      }
+                      value={pendingInterval ?? (selectedWorkflow.poll_interval_seconds || 3600)}
+                      onChange={(e) => setPendingInterval(Number(e.target.value) || 3600)}
                     >
                       {INTERVAL_OPTIONS.map((opt) => (
                         <option key={opt.value} value={opt.value}>
@@ -459,6 +482,24 @@ export default function WorkflowsInterface() {
                         </option>
                       ))}
                     </select>
+                    {pendingInterval !== null && pendingInterval !== selectedWorkflow.poll_interval_seconds && (
+                      <div className="flex items-center gap-1 mt-1">
+                        <button
+                          type="button"
+                          onClick={handleSaveInterval}
+                          className="text-[10px] px-2 py-0.5 rounded-md bg-green-600 text-white hover:bg-green-700"
+                        >
+                          Save
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleCancelInterval}
+                          className="text-[10px] px-2 py-0.5 rounded-md border border-border bg-background text-foreground hover:bg-muted"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    )}
                     <p className="text-[10px] text-muted-foreground">
                       Next run in{' '}
                       <span className="font-semibold">

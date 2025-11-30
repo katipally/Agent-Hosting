@@ -112,9 +112,23 @@ SESSION_TTL_SECONDS = 60 * 60 * 24 * 7
 
 
 def _cookie_settings() -> Dict[str, Any]:
+    """Get cookie settings based on environment.
+    
+    For cross-subdomain auth (e.g., app.domain.com + api.domain.com):
+    - Set COOKIE_DOMAIN=.domain.com in .env
+    - This allows SameSite=Lax (more secure, better browser support)
+    
+    For cross-origin auth (different domains):
+    - Leave COOKIE_DOMAIN empty
+    - Uses SameSite=None (required for cross-origin, but blocked by some browsers)
+    """
+    frontend_url = Config.FRONTEND_BASE_URL or ""
+    cookie_domain = Config.COOKIE_DOMAIN or ""
+    
     is_local = (
-        Config.FRONTEND_BASE_URL.startswith("http://localhost")
-        or Config.FRONTEND_BASE_URL.startswith("http://127.0.0.1")
+        frontend_url.startswith("http://localhost")
+        or frontend_url.startswith("http://127.0.0.1")
+        or not frontend_url  # Empty = assume local dev
     )
 
     if is_local:
@@ -125,12 +139,24 @@ def _cookie_settings() -> Dict[str, Any]:
             "samesite": "lax",
         }
 
-    return {
+    # Production settings
+    settings: Dict[str, Any] = {
         "path": "/",
         "httponly": True,
         "secure": True,
-        "samesite": "none",
     }
+    
+    # If COOKIE_DOMAIN is set, we're using same-root-domain setup
+    # which allows SameSite=Lax (more compatible with browsers)
+    if cookie_domain:
+        settings["domain"] = cookie_domain
+        settings["samesite"] = "lax"
+    else:
+        # Cross-origin setup requires SameSite=None
+        # Note: This is blocked by Safari ITP and some other browsers
+        settings["samesite"] = "none"
+    
+    return settings
 
 
 def _delete_app_session(session_id: str) -> None:
@@ -177,6 +203,13 @@ def _get_user_from_session_id(session_id: Optional[str]) -> AppUser:
 
 def get_current_user(request: Request) -> AppUser:
     session_id = request.cookies.get(SESSION_COOKIE_NAME)
+    if not session_id:
+        user_agent = request.headers.get("user-agent", "unknown")
+        logger.warning(
+            "No session cookie found - UserAgent: %s, Cookies: %s",
+            user_agent[:100] if user_agent else "none",
+            list(request.cookies.keys())
+        )
     return _get_user_from_session_id(session_id)
 
 
@@ -322,7 +355,9 @@ from settings.service import (
     get_effective_openai_key,
     get_effective_llm_model,
     get_effective_notion_token,
+    get_effective_slack_bot_token,
     bootstrap_app_settings_from_config_if_empty,
+    sync_workspace_settings_from_config,
 )
 
 # Import embedding synchronizer for pipeline integration
@@ -552,8 +587,11 @@ async def google_login(request: Request, redirect_path: Optional[str] = "/"):
 async def google_callback(request: Request, code: Optional[str] = None, state: Optional[str] = None, error: Optional[str] = None):
     """Handle Google OAuth callback, create/update user, and set session cookie."""
 
-    frontend_base = Config.FRONTEND_BASE_URL or "http://localhost:5173"
-    default_redirect = frontend_base.rstrip("/") or "http://localhost:5173"
+    # Prefer explicit FRONTEND_BASE_URL, but fall back to the callback's base URL
+    frontend_base = (Config.FRONTEND_BASE_URL or "").rstrip("/")
+    if not frontend_base:
+        frontend_base = str(request.base_url).rstrip("/")
+    default_redirect = frontend_base
 
     if error or not code:
         redirect_url = f"{default_redirect}?auth_error={error or 'missing_code'}"
@@ -696,15 +734,96 @@ async def google_callback(request: Request, code: Optional[str] = None, state: O
         session.add(app_session)
         session.commit()
 
-    redirect_url = f"{default_redirect}{redirect_path}"
+    # Log successful session creation
+    user_agent = request.headers.get("user-agent", "unknown")
+    logger.info(
+        "OAuth callback successful - User: %s, SessionID: %s, UserAgent: %s",
+        email,
+        session_id,
+        user_agent[:100] if user_agent else "none"
+    )
+
+    # Add session token to URL as fallback for mobile Safari (ITP workaround)
+    # The frontend will call /auth/session-exchange to set the cookie
+    redirect_separator = "&" if "?" in redirect_path else "?"
+    redirect_url = f"{default_redirect}{redirect_path}{redirect_separator}_session_token={session_id}"
+    
     response = RedirectResponse(url=redirect_url, status_code=status.HTTP_302_FOUND)
     if session_id:
+        cookie_settings = _cookie_settings()
+        logger.info(
+            "Setting session cookie - SessionID: %s, Settings: %s",
+            session_id[:8] + "...",
+            cookie_settings
+        )
         response.set_cookie(
             key=SESSION_COOKIE_NAME,
             value=session_id,
             max_age=SESSION_TTL_SECONDS,
-            **_cookie_settings(),
+            **cookie_settings,
         )
+    return response
+
+
+@app.post("/auth/session-exchange")
+async def session_exchange(request: Request):
+    """Exchange a session token from URL for a proper session cookie.
+    
+    This is a workaround for mobile Safari's Intelligent Tracking Prevention (ITP)
+    which blocks cross-site cookies even with SameSite=None. The frontend calls
+    this endpoint with the token from the URL to set the cookie via a same-site request.
+    """
+    try:
+        body = await request.json()
+        token = body.get("token")
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid request body"
+        )
+    
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing token"
+        )
+    
+    # Validate the token is a valid session
+    with db_manager.get_session() as session:
+        app_session = session.query(AppSession).filter_by(id=token).first()
+        if not app_session:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or expired token"
+            )
+        
+        # Check if session is expired
+        if app_session.expires_at and app_session.expires_at < datetime.utcnow():
+            session.delete(app_session)
+            session.commit()
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Session expired"
+            )
+        
+        # Update last_seen
+        app_session.last_seen_at = datetime.utcnow()
+        session.commit()
+    
+    # Set the cookie via a same-site response
+    response = JSONResponse({"detail": "session_set"})
+    cookie_settings = _cookie_settings()
+    logger.info(
+        "Session exchange successful - SessionID: %s, Settings: %s",
+        token[:8] + "...",
+        cookie_settings
+    )
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=token,
+        max_age=SESSION_TTL_SECONDS,
+        **cookie_settings,
+    )
     return response
 
 
@@ -722,8 +841,18 @@ async def logout(request: Request):
 
 
 @app.get("/auth/me")
-async def auth_me(current_user: AppUser = Depends(get_current_user)):
+async def auth_me(request: Request, current_user: AppUser = Depends(get_current_user)):
     """Return the current authenticated user's profile."""
+
+    # Log successful authentication
+    user_agent = request.headers.get("user-agent", "unknown")
+    session_id = request.cookies.get(SESSION_COOKIE_NAME, "none")
+    logger.info(
+        "Auth check successful - User: %s, SessionID: %s, UserAgent: %s",
+        current_user.email,
+        session_id[:8] + "..." if session_id != "none" else "none",
+        user_agent[:100] if user_agent else "none"
+    )
 
     return {
         "id": current_user.id,
@@ -734,9 +863,19 @@ async def auth_me(current_user: AppUser = Depends(get_current_user)):
     }
 
 # CORS middleware for React frontend
-_frontend_origins = ["http://localhost:5173", "http://localhost:3000"]
-if Config.FRONTEND_BASE_URL and Config.FRONTEND_BASE_URL not in _frontend_origins:
+_frontend_origins: list[str] = []
+if Config.FRONTEND_BASE_URL:
     _frontend_origins.append(Config.FRONTEND_BASE_URL)
+
+extra_origins = os.getenv("CORS_ALLOWED_ORIGINS", "")
+for origin in extra_origins.split(","):
+    origin = origin.strip()
+    if origin and origin not in _frontend_origins:
+        _frontend_origins.append(origin)
+
+if not _frontend_origins:
+    # Fallback to permissive CORS when no origins are configured
+    _frontend_origins.append("*")
 
 logger.info("Configured CORS allowed origins: %s", _frontend_origins)
 
@@ -773,10 +912,17 @@ async def stop_workflow_worker() -> None:
     _stop_workflow_worker_internal()
 
 # Request/Response models
+class SourcePreferences(BaseModel):
+    slack: bool = True
+    gmail: bool = True
+    notion: bool = True
+
+
 class ChatRequest(BaseModel):
     """Chat request model."""
     query: str
     conversation_history: Optional[List[Dict[str, str]]] = None
+    source_prefs: Optional[SourcePreferences] = None
 
 
 class ChatResponse(BaseModel):
@@ -792,6 +938,22 @@ class HealthResponse(BaseModel):
     models_loaded: bool
     ai_brain_loaded: bool
     capabilities: List[str]
+
+
+class ConnectorHealth(BaseModel):
+    """Status for a single external connector (Slack, Gmail, Notion)."""
+
+    status: str  # connected, disconnected, degraded
+    detail: Optional[str] = None
+
+
+class ChatConnectorHealthResponse(BaseModel):
+    """Aggregated connector health for the chat UI."""
+
+    overall_status: str
+    slack: ConnectorHealth
+    gmail: ConnectorHealth
+    notion: ConnectorHealth
 
 
 class UserSettingsUpdate(BaseModel):
@@ -882,7 +1044,7 @@ class WorkflowChannelPayload(BaseModel):
     slack_channel_name: Optional[str] = None
 
 
-WORKFLOW_ALLOWED_INTERVALS = {30, 60, 300, 600, 3600}
+WORKFLOW_ALLOWED_INTERVALS = {30,3600, 10800, 28800, 86400}
 
 
 # Routes
@@ -895,6 +1057,60 @@ async def root():
         "ai_brain_loaded": ai_brain is not None,
         "capabilities": ["slack", "gmail", "notion", "rag_search"] if ai_brain else []
     }
+
+
+@app.get("/api/chat/connectors/status", response_model=ChatConnectorHealthResponse)
+async def get_chat_connector_status(
+    current_user: AppUser = Depends(get_current_user),
+):
+    """Return high-level connector health for Slack, Gmail, and Notion.
+
+    This is used by the Chat UI header to show per-platform status. It is a
+    lightweight check based primarily on configuration and user OAuth state,
+    and does not perform heavy API calls.
+    """
+
+    # Slack workspace-level status
+    slack_token = get_effective_slack_bot_token(db_manager)
+    if slack_token:
+        slack_status = "connected"
+        slack_detail = "Slack bot token configured"
+    else:
+        slack_status = "disconnected"
+        slack_detail = "Slack bot token not configured"
+
+    # Gmail per-user status
+    if getattr(current_user, "has_gmail_access", False):
+        gmail_status = "connected"
+        gmail_detail = "Gmail authorized for current user"
+    else:
+        gmail_status = "disconnected"
+        gmail_detail = "Gmail not authorized for current user"
+
+    # Notion workspace-level status
+    notion_token = get_effective_notion_token(db_manager)
+    if notion_token:
+        notion_status = "connected"
+        notion_detail = "Notion token configured"
+    else:
+        notion_status = "disconnected"
+        notion_detail = "Notion token not configured"
+
+    # Derive overall status
+    connector_statuses = {slack_status, gmail_status, notion_status}
+    if connector_statuses == {"connected"}:
+        overall_status = "connected"
+    elif connector_statuses == {"disconnected"}:
+        overall_status = "disconnected"
+    else:
+        overall_status = "degraded"
+
+    return ChatConnectorHealthResponse(
+        overall_status=overall_status,
+        slack=ConnectorHealth(status=slack_status, detail=slack_detail),
+        gmail=ConnectorHealth(status=gmail_status, detail=gmail_detail),
+        notion=ConnectorHealth(status=notion_status, detail=notion_detail),
+    )
 
 
 @app.get("/api/settings/me")
@@ -952,6 +1168,27 @@ async def update_workspace_settings_endpoint(
 
     data = payload.dict(exclude_unset=True)
     result = update_workspace_settings(db_manager, data)
+
+    # Clear cached AI engines so they are rebuilt with new settings on next use.
+    rag_engine = None
+    ai_brain = None
+
+    return result
+
+
+@app.post("/api/settings/workspace/sync-from-env")
+async def sync_workspace_settings_from_env_endpoint(
+    current_user: AppUser = Depends(get_current_user),
+):
+    """Sync workspace-wide settings from current Config/env values.
+
+    This is used by the Workspace settings UI "Sync from env" button to pull
+    values from .env/Config into the AppSettings document.
+    """
+
+    global rag_engine, ai_brain
+
+    result = sync_workspace_settings_from_config(db_manager)
 
     # Clear cached AI engines so they are rebuilt with new settings on next use.
     rag_engine = None
@@ -1170,10 +1407,13 @@ async def chat_message(
         full_response = ""
         sources = []
         
+        prefs_dict = request.source_prefs.dict() if request.source_prefs else None
+
         async for event in brain.stream_query(
             request.query,
             request.conversation_history or [],
             user_email=current_user.email,
+            source_prefs=prefs_dict,
         ):
             if event.get('type') == 'token':
                 full_response += event.get('content', '')
@@ -1278,6 +1518,7 @@ async def websocket_chat(websocket: WebSocket):
                 message_data = json.loads(data)
                 query = message_data.get('query', '').strip()
                 session_id = message_data.get('session_id', 'default')
+                source_prefs = message_data.get('source_prefs') or None
                 
                 if not query:
                     await websocket.send_json({
@@ -1348,6 +1589,7 @@ async def websocket_chat(websocket: WebSocket):
                         query,
                         conversation_history,
                         user_email=current_user.email,
+                        source_prefs=source_prefs,
                     ):
                         try:
                             await websocket.send_json(event)
@@ -1390,6 +1632,10 @@ async def websocket_chat(websocket: WebSocket):
                     except:
                         break
             
+            except WebSocketDisconnect as e:
+                logger.debug(f"WebSocket disconnected during processing: {e}")
+                break
+
             except json.JSONDecodeError:
                 logger.warning("Invalid JSON received")
                 try:
@@ -2374,11 +2620,11 @@ async def create_workflow(payload: WorkflowCreateRequest):
                 detail="Unsupported workflow type; only 'slack_to_notion' is supported",
             )
 
-        interval = payload.poll_interval_seconds or 30
+        interval = payload.poll_interval_seconds or 3600
         if interval not in WORKFLOW_ALLOWED_INTERVALS:
             raise HTTPException(
                 status_code=400,
-                detail="Invalid poll_interval_seconds; allowed values are 30, 60, 300, 600, 3600",
+                detail="Invalid poll_interval_seconds; allowed values are 3600, 10800, 28800, 86400",
             )
 
         status = payload.status or "active"
@@ -2461,7 +2707,7 @@ async def update_workflow_endpoint(workflow_id: str, payload: WorkflowUpdateRequ
             if interval not in WORKFLOW_ALLOWED_INTERVALS:
                 raise HTTPException(
                     status_code=400,
-                    detail="Invalid poll_interval_seconds; allowed values are 30, 60, 300, 600, 3600",
+                    detail="Invalid poll_interval_seconds; allowed values are 3600, 10800, 28800, 86400",
                 )
 
         workflow = db_manager.update_workflow(workflow_id, **fields)
@@ -2904,22 +3150,22 @@ async def get_slack_pipeline_data(
     """
 
     try:
+        # Use batch query to avoid N+1 problem (was 1 query per channel!)
         channels = db_manager.get_all_channels(include_archived=True)
         stats = db_manager.get_statistics()
+        message_counts = db_manager.get_messages_count_by_channel()
 
-        channel_data = []
-        for ch in channels:
-            message_count = db_manager.get_messages_count(channel_id=ch.channel_id)
-            channel_data.append(
-                {
-                    "channel_id": ch.channel_id,
-                    "name": ch.name,
-                    "is_private": ch.is_private,
-                    "is_archived": ch.is_archived,
-                    "num_members": ch.num_members,
-                    "message_count": message_count,
-                }
-            )
+        channel_data = [
+            {
+                "channel_id": ch.channel_id,
+                "name": ch.name,
+                "is_private": ch.is_private,
+                "is_archived": ch.is_archived,
+                "num_members": ch.num_members,
+                "message_count": message_counts.get(ch.channel_id, 0),
+            }
+            for ch in channels
+        ]
 
         return {
             "stats": stats,
@@ -3740,9 +3986,18 @@ def _summarize_notion_properties(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
     return items
 
 
-def _summarize_notion_blocks(blocks: List[Dict[str, Any]]) -> Tuple[List[str], List[Dict[str, Any]]]:
+def _summarize_notion_blocks(
+    blocks: List[Dict[str, Any]],
+    include_databases: bool = True,
+) -> Tuple[List[str], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Summarize Notion blocks into text lines, attachments, and database references.
+    
+    Returns:
+        Tuple of (text_lines, attachments, child_databases)
+    """
     lines: List[str] = []
     attachments: List[Dict[str, Any]] = []
+    child_databases: List[Dict[str, Any]] = []
 
     for block in blocks:
         if not isinstance(block, dict):
@@ -3752,6 +4007,18 @@ def _summarize_notion_blocks(blocks: List[Dict[str, Any]]) -> Tuple[List[str], L
             continue
 
         value = block.get(block_type) or {}
+
+        # Handle child_database blocks
+        if block_type == "child_database" and include_databases:
+            db_id = block.get("id")
+            db_title = value.get("title", "Database")
+            if db_id:
+                child_databases.append({
+                    "id": db_id,
+                    "title": db_title,
+                    "type": "child_database",
+                })
+            continue
 
         if block_type in (
             "paragraph",
@@ -3804,7 +4071,156 @@ def _summarize_notion_blocks(blocks: List[Dict[str, Any]]) -> Tuple[List[str], L
                 }
             )
 
-    return lines, attachments
+        # Handle embed and bookmark blocks
+        if block_type in ("embed", "bookmark", "link_preview"):
+            url = value.get("url", "")
+            caption_texts = []
+            for rt in value.get("caption") or []:
+                if isinstance(rt, dict):
+                    txt = rt.get("plain_text") or rt.get("text", {}).get("content")
+                    if txt:
+                        caption_texts.append(txt)
+            name = "".join(caption_texts) if caption_texts else url
+            if url:
+                attachments.append({
+                    "id": block.get("id"),
+                    "type": block_type,
+                    "name": name,
+                    "url": url,
+                })
+
+        # Handle code blocks
+        if block_type == "code":
+            language = value.get("language", "")
+            rich_text = value.get("rich_text") or []
+            code_parts = []
+            for rt in rich_text:
+                if isinstance(rt, dict):
+                    txt = rt.get("plain_text", "")
+                    if txt:
+                        code_parts.append(txt)
+            code_text = "".join(code_parts)
+            if code_text:
+                lines.append(f"```{language}")
+                lines.append(code_text)
+                lines.append("```")
+
+        # Handle table_row blocks
+        if block_type == "table_row":
+            cells = value.get("cells", [])
+            cell_texts = []
+            for cell in cells:
+                cell_parts = []
+                for rt in cell:
+                    if isinstance(rt, dict):
+                        txt = rt.get("plain_text", "")
+                        if txt:
+                            cell_parts.append(txt)
+                cell_texts.append("".join(cell_parts))
+            if cell_texts:
+                lines.append("| " + " | ".join(cell_texts) + " |")
+
+        # Handle divider blocks
+        if block_type == "divider":
+            lines.append("---")
+
+    return lines, attachments, child_databases
+
+
+def _query_notion_database_for_api(database_id: str, db_title: Optional[str] = None) -> Dict[str, Any]:
+    """Query a Notion database and return its entries formatted for the API.
+    
+    If the database returns 0 entries (possibly a linked view), will search
+    for the original database by title.
+    """
+    from core.notion_export.client import NotionClient
+    
+    token = Config.NOTION_TOKEN
+    if not token:
+        return {"entries": [], "error": "NOTION_TOKEN not configured"}
+    
+    try:
+        client = NotionClient(token)
+        
+        # Get database metadata
+        db_meta = client.get_database(database_id)
+        actual_db_id = database_id
+        
+        if db_meta:
+            # Get database title
+            title_parts = db_meta.get("title", [])
+            db_title = "".join(t.get("plain_text", "") for t in title_parts) or db_title
+        
+        # Get schema
+        schema = db_meta.get("properties", {}) if db_meta else {}
+        
+        # Get title column
+        title_col = None
+        for col_name, col_schema in schema.items():
+            if col_schema.get("type") == "title":
+                title_col = col_name
+                break
+        
+        # Query entries (up to 500)
+        entries = client.query_database(database_id, max_results=500)
+        
+        # If no entries, this might be a LINKED database view
+        # Try to find the original database by title
+        if not entries and db_title:
+            logger.info(f"No entries for {database_id}, searching for original database '{db_title}'")
+            original_db = client.find_database_by_title(db_title)
+            if original_db:
+                original_id = original_db.get("id")
+                if original_id and original_id != database_id:
+                    logger.info(f"Found original database: {original_id}")
+                    actual_db_id = original_id
+                    db_meta = original_db
+                    schema = db_meta.get("properties", {})
+                    # Update title_col
+                    title_col = None
+                    for col_name, col_schema in schema.items():
+                        if col_schema.get("type") == "title":
+                            title_col = col_name
+                            break
+                    entries = client.query_database(actual_db_id, max_results=500)
+        
+        if not db_meta:
+            return {"entries": [], "error": "Could not access database"}
+        
+        # Order columns: title first, then other important columns, then rest
+        ordered_columns = []
+        other_columns = []
+        for col_name, col_schema in schema.items():
+            if col_schema.get("type") == "title":
+                ordered_columns.insert(0, col_name)  # Title first
+            elif col_name.lower() in ["name", "status", "priority", "date", "due date", "assignee"]:
+                ordered_columns.append(col_name)  # Important columns early
+            else:
+                other_columns.append(col_name)
+        ordered_columns.extend(sorted(other_columns))
+        
+        formatted_entries = []
+        for entry in entries:
+            formatted = client.format_database_entry(entry)
+            props = formatted["properties"]
+            
+            entry_data = {
+                "id": formatted["id"],
+                "title": props.get(title_col, "Untitled") if title_col else "Untitled",
+                "properties": props,
+            }
+            formatted_entries.append(entry_data)
+        
+        return {
+            "database_id": actual_db_id,
+            "title": "".join(t.get("plain_text", "") for t in db_meta.get("title", [])) if db_meta else db_title,
+            "columns": ordered_columns,
+            "entries": formatted_entries,
+            "total": len(formatted_entries),
+        }
+    except Exception as e:
+        logger.error(f"Error querying database {database_id}: {e}")
+        return {"entries": [], "error": str(e)}
 
 
 def _persist_notion_pages(
@@ -4168,7 +4584,13 @@ async def get_notion_hierarchy():
 
 
 @app.get("/api/notion/page-content")
-async def get_notion_page_content(page_id: str):
+async def get_notion_page_content(page_id: str, include_databases: bool = True):
+    """Get content of a Notion page including any embedded databases.
+    
+    Args:
+        page_id: The Notion page ID
+        include_databases: If True, query and include content from child databases
+    """
     token = Config.NOTION_TOKEN
     if not token:
         raise HTTPException(
@@ -4186,46 +4608,133 @@ async def get_notion_page_content(page_id: str):
     next_cursor: Optional[str] = None
 
     try:
-        while True:
-            params: Dict[str, Any] = {"page_size": 50}
-            if next_cursor:
-                params["start_cursor"] = next_cursor
+        # First check if this page_id is actually a database
+        from core.notion_export.client import NotionClient
+        client = NotionClient(token)
+        db_meta = client.get_database(page_id)
+        
+        if db_meta:
+            # It's a database! Query it directly
+            logger.info(f"Page {page_id} is a database, querying directly")
+            db_data = _query_notion_database_for_api(page_id)
+            
+            # If database has entries, return as database
+            if db_data.get("entries"):
+                return {
+                    "page_id": page_id,
+                    "content": "",
+                    "attachments": [],
+                    "is_database": True,
+                    "database": db_data,
+                    "child_databases": [],
+                }
+            else:
+                # Database exists but no entries - might be a linked view
+                # Try to find the original database by title
+                db_title = db_data.get("title")
+                if db_title:
+                    logger.info(f"Database {page_id} has 0 entries, searching for original by title '{db_title}'")
+                    original_db = client.find_database_by_title(db_title)
+                    if original_db and original_db.get("id") != page_id:
+                        original_id = original_db.get("id")
+                        logger.info(f"Found original database: {original_id}")
+                        db_data = _query_notion_database_for_api(original_id, db_title=db_title)
+                        if db_data.get("entries"):
+                            return {
+                                "page_id": page_id,
+                                "content": "",
+                                "attachments": [],
+                                "is_database": True,
+                                "database": db_data,
+                                "child_databases": [],
+                            }
+                
+                # Still no entries - return what we have
+                return {
+                    "page_id": page_id,
+                    "content": "",
+                    "attachments": [],
+                    "is_database": True,
+                    "database": db_data,
+                    "child_databases": [],
+                }
 
-            resp = requests.get(
-                f"https://api.notion.com/v1/blocks/{page_id}/children",
-                headers=headers,
-                params=params,
-                timeout=30,
-            )
+        # Helper function to recursively fetch blocks
+        def fetch_blocks_recursive(block_id: str, depth: int = 0, max_depth: int = 5) -> List[Dict[str, Any]]:
+            """Recursively fetch all blocks including children (for tables, toggles, etc.)"""
+            if depth > max_depth:
+                return []
+            
+            blocks: List[Dict[str, Any]] = []
+            cursor: Optional[str] = None
+            
+            while True:
+                params: Dict[str, Any] = {"page_size": 100}
+                if cursor:
+                    params["start_cursor"] = cursor
 
-            if resp.status_code != 200:
-                logger.error(
-                    "Notion blocks API error %s: %s",
-                    resp.status_code,
-                    resp.text[:200],
+                resp = requests.get(
+                    f"https://api.notion.com/v1/blocks/{block_id}/children",
+                    headers=headers,
+                    params=params,
+                    timeout=30,
                 )
-                raise HTTPException(
-                    status_code=resp.status_code,
-                    detail=f"Notion API error {resp.status_code}",
-                )
 
-            data = resp.json()
-            results = data.get("results", []) or []
-            all_blocks.extend(results)
+                if resp.status_code != 200:
+                    logger.error(
+                        "Notion blocks API error %s for block %s: %s",
+                        resp.status_code,
+                        block_id,
+                        resp.text[:200],
+                    )
+                    break
 
-            if not data.get("has_more"):
-                break
-            next_cursor = data.get("next_cursor")
-            if not next_cursor:
-                break
+                data = resp.json()
+                results = data.get("results", []) or []
+                
+                for block in results:
+                    blocks.append(block)
+                    # Recursively fetch children for blocks that have them
+                    # (tables, toggles, columns, synced_blocks, etc.)
+                    if block.get("has_children"):
+                        child_blocks = fetch_blocks_recursive(block.get("id"), depth + 1, max_depth)
+                        blocks.extend(child_blocks)
 
-        text_lines, attachments = _summarize_notion_blocks(all_blocks)
+                if not data.get("has_more"):
+                    break
+                cursor = data.get("next_cursor")
+                if not cursor:
+                    break
+            
+            return blocks
+
+        # It's a regular page - get blocks recursively
+        all_blocks = fetch_blocks_recursive(page_id)
+
+        text_lines, attachments, child_databases = _summarize_notion_blocks(
+            all_blocks, include_databases=include_databases
+        )
         content = "\n".join(text_lines)
+
+        # Query any child databases found
+        databases_content = []
+        if include_databases and child_databases:
+            for db_ref in child_databases:
+                db_id = db_ref.get("id")
+                db_title = db_ref.get("title", "Database")
+                if db_id:
+                    # Pass title so we can find original if this is a linked view
+                    db_data = _query_notion_database_for_api(db_id, db_title=db_title)
+                    if not db_data.get("title"):
+                        db_data["title"] = db_title
+                    databases_content.append(db_data)
 
         return {
             "page_id": page_id,
             "content": content,
             "attachments": attachments,
+            "is_database": False,
+            "child_databases": databases_content,
         }
 
     except HTTPException:

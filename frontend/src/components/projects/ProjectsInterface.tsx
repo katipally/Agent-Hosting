@@ -222,12 +222,22 @@ export default function ProjectsInterface() {
     }
   }
 
+  // Track which source options have been loaded
+  const [sourcesLoaded, setSourcesLoaded] = useState(false)
+
   useEffect(() => {
+    // Only load project list initially - source options are loaded on-demand
     loadProjects()
-    loadSlackChannels()
-    loadGmailLabels()
-    loadNotionPages()
   }, [])
+
+  // Load source options only when a project is selected (user might add sources)
+  useEffect(() => {
+    if (!selectedProjectId || sourcesLoaded) return
+    // Load source options in background after project is selected
+    Promise.all([loadSlackChannels(), loadGmailLabels(), loadNotionPages()]).then(() => {
+      setSourcesLoaded(true)
+    })
+  }, [selectedProjectId, sourcesLoaded])
 
   useEffect(() => {
     if (selectedProjectId) {

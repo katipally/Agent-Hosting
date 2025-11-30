@@ -177,6 +177,16 @@ class UpdateProjectNotionInput(BaseModel):
     days_back: int = Field(default=7, description="Days of history to include")
 
 
+# In-memory cache for Slack channels to avoid repeated API pagination
+_slack_channel_cache: Dict[str, Any] = {
+    "channels": [],
+    "by_name": {},
+    "by_id": {},
+    "fetched_at": 0,
+}
+_SLACK_CACHE_TTL_SECONDS = 300  # 5 minutes
+
+
 class WorkforceTools:
     """Collection of tools for the AI agent - Comprehensive API access."""
     
@@ -318,6 +328,77 @@ class WorkforceTools:
             logger.info(f"Caching {len(messages)} messages to database")
         except Exception as e:
             logger.error(f"Error caching messages: {e}")
+
+    def _get_slack_channels_cached(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
+        """Get Slack channels with in-memory caching to avoid repeated API pagination."""
+        import time
+        global _slack_channel_cache
+
+        now = time.time()
+        cache_age = now - _slack_channel_cache["fetched_at"]
+
+        if not force_refresh and _slack_channel_cache["channels"] and cache_age < _SLACK_CACHE_TTL_SECONDS:
+            return _slack_channel_cache["channels"]
+
+        if not self.slack_client:
+            return []
+
+        channels: List[Dict[str, Any]] = []
+        cursor: Optional[str] = None
+
+        try:
+            while True:
+                result = self.slack_client.conversations_list(
+                    exclude_archived=False,
+                    types="public_channel,private_channel",
+                    cursor=cursor,
+                )
+                batch = result.get("channels", [])
+                channels.extend(batch)
+
+                response_metadata = result.get("response_metadata") or {}
+                cursor = response_metadata.get("next_cursor") or ""
+                if not cursor:
+                    break
+
+            # Build lookup dicts
+            by_name = {ch.get("name", ""): ch for ch in channels}
+            by_id = {ch.get("id", ""): ch for ch in channels}
+
+            _slack_channel_cache = {
+                "channels": channels,
+                "by_name": by_name,
+                "by_id": by_id,
+                "fetched_at": now,
+            }
+        except Exception as e:
+            logger.error(f"Error fetching Slack channels: {e}")
+
+        return _slack_channel_cache["channels"]
+
+    def _resolve_slack_channel_id(self, channel: str) -> Optional[str]:
+        """Resolve a channel name or ID to a Slack channel ID using cached data."""
+        normalized = self._normalize_slack_channel(channel)
+
+        # If it already looks like a channel ID, return it
+        if channel.startswith("C") or channel.startswith("G"):
+            return channel
+
+        # Try cache first
+        self._get_slack_channels_cached()
+        global _slack_channel_cache
+
+        ch = _slack_channel_cache["by_name"].get(normalized)
+        if ch:
+            return ch.get("id")
+
+        # If not found in cache, force refresh once and try again
+        self._get_slack_channels_cached(force_refresh=True)
+        ch = _slack_channel_cache["by_name"].get(normalized)
+        if ch:
+            return ch.get("id")
+
+        return None
     
     # ========================================
     # SLACK TOOLS - Call API Directly
@@ -332,31 +413,24 @@ class WorkforceTools:
         try:
             if not self.slack_client:
                 return "❌ Slack API not configured. Check SLACK_BOT_TOKEN in .env"
-            
-            # Call Slack API directly
-            result = self.slack_client.conversations_list(
-                exclude_archived=False,
-                types="public_channel,private_channel"
-            )
-            
-            channels = result.get('channels', [])
-            
+
+            # Use cached channel list for speed
+            channels = self._get_slack_channels_cached()
+
             if not channels:
                 return "No Slack channels found. You may need to invite the bot to channels."
-            
-            # Format results
+
             results = [f"Found {len(channels)} Slack channels:\n"]
             for ch in channels:
-                name = ch.get('name', 'unknown')
-                channel_id = ch.get('id', '')
-                members = ch.get('num_members', 0)
-                is_private = ch.get('is_private', False)
+                name = ch.get("name", "unknown")
+                channel_id = ch.get("id", "")
+                members = ch.get("num_members", 0)
+                is_private = ch.get("is_private", False)
                 privacy = "🔒 Private" if is_private else "🌐 Public"
                 results.append(f"  #{name} - {privacy} - {members} members (ID: {channel_id})")
-            
-            # Store in database for future use
+
             self._cache_channels_to_db(channels)
-            
+
             return "\n".join(results)
         
         except Exception as e:
@@ -381,21 +455,10 @@ class WorkforceTools:
             if err:
                 return f"❌ {err}"
             
-            # Get channel ID if name provided
-            channel_id = channel
-            if not channel.startswith('C'):  # Not a channel ID
-                # Find channel by name
-                result = self.slack_client.conversations_list()
-                channels = result.get('channels', [])
-                found = False
-                for ch in channels:
-                    if ch['name'] == channel.lstrip('#'):
-                        channel_id = ch['id']
-                        found = True
-                        break
-                
-                if not found:
-                    return f"❌ Channel '{channel}' not found. Use get_all_slack_channels to see available channels."
+            # Resolve channel name to ID using cached lookup (fast)
+            channel_id = self._resolve_slack_channel_id(channel)
+            if not channel_id:
+                return f"❌ Channel '{channel}' not found. Use get_all_slack_channels to see available channels."
             
             # Get messages from Slack API
             result = self.slack_client.conversations_history(
@@ -474,8 +537,12 @@ class WorkforceTools:
                     err = self._check_slack_read_allowed(channel)
                     if err:
                         return f"❌ {err}"
+                    normalized = self._normalize_slack_channel(channel)
                     db_query = db_query.filter(
-                        (Channel.name == channel) | (Channel.id == channel)
+                        or_(
+                            Channel.name == normalized,
+                            Channel.channel_id == channel,
+                        )
                     )
                 
                 # Text search
@@ -1400,6 +1467,489 @@ class WorkforceTools:
     # ADVANCED NOTION TOOLS
     # ========================================
 
+    def get_notion_database_content(
+        self,
+        database_id: str,
+        max_entries: int = 500,
+        filter_property: Optional[str] = None,
+        filter_value: Optional[str] = None,
+        as_markdown_table: bool = True,
+    ) -> str:
+        """Get ALL entries from a Notion database with their properties.
+
+        This is specifically for Notion DATABASES (tables with rows and columns).
+        Use this when a page contains structured data like a table/list with
+        multiple entries and columns (e.g., Projects, Tasks, Contacts, etc.).
+
+        Args:
+            database_id: The Notion database ID or URL
+            max_entries: Maximum number of entries to return (default 500 for complete data)
+            filter_property: Optional property name to filter by
+            filter_value: Optional value to filter for (used with filter_property)
+            as_markdown_table: If True, format as markdown table for better display
+
+        Returns:
+            Formatted database content with all entries and their properties
+        """
+        try:
+            if not self.notion_client or not self.notion_client.test_connection():
+                return "❌ Notion not connected"
+
+            normalized_id = _normalize_notion_id(database_id)
+            if not normalized_id:
+                return "❌ Invalid database_id. Please pass a Notion database ID or full Notion URL."
+
+            # First try to get database metadata to confirm it's a database
+            db_meta = self.notion_client.get_database(normalized_id)
+            db_title = "Untitled Database"
+            
+            if db_meta:
+                # Get database title
+                title_parts = db_meta.get("title", [])
+                db_title = "".join(t.get("plain_text", "") for t in title_parts) or "Untitled Database"
+
+            # Get database schema (properties/columns)
+            schema = db_meta.get("properties", {}) if db_meta else {}
+            
+            # Build filter if specified
+            filter_obj = None
+            if filter_property and filter_value and filter_property in schema:
+                prop_type = schema[filter_property].get("type")
+                if prop_type in ("title", "rich_text"):
+                    filter_obj = {
+                        "property": filter_property,
+                        prop_type: {"contains": filter_value}
+                    }
+                elif prop_type == "select":
+                    filter_obj = {
+                        "property": filter_property,
+                        "select": {"equals": filter_value}
+                    }
+                elif prop_type == "status":
+                    filter_obj = {
+                        "property": filter_property,
+                        "status": {"equals": filter_value}
+                    }
+
+            # Query database entries - get ALL of them
+            entries = self.notion_client.query_database(
+                normalized_id,
+                filter_obj=filter_obj,
+                max_results=max_entries,
+            )
+
+            # If no entries found, this might be a LINKED database view
+            # Try to find the original database by title
+            if not entries and db_title and db_title != "Untitled Database":
+                logger.info(f"No entries for {normalized_id}, searching for original database '{db_title}'")
+                original_db = self.notion_client.find_database_by_title(db_title)
+                if original_db:
+                    original_id = original_db.get("id")
+                    if original_id and original_id != normalized_id:
+                        logger.info(f"Found original database: {original_id}")
+                        normalized_id = original_id
+                        db_meta = original_db
+                        schema = db_meta.get("properties", {})
+                        entries = self.notion_client.query_database(
+                            normalized_id,
+                            filter_obj=filter_obj,
+                            max_results=max_entries,
+                        )
+            
+            # If still no metadata, we can't proceed
+            if not db_meta:
+                return f"❌ Could not find database {database_id}. Make sure the Notion integration has access to it."
+
+            # Order columns: title first, then others
+            title_col = None
+            other_cols = []
+            for col_name, col_schema in schema.items():
+                if col_schema.get("type") == "title":
+                    title_col = col_name
+                else:
+                    other_cols.append(col_name)
+            columns = ([title_col] if title_col else []) + sorted(other_cols)
+
+            if not entries:
+                return f"📊 **Database: {db_title}**\n**Database ID**: `{normalized_id}`\n\nNo entries found. (This may be a linked database - ensure the original database is shared with the integration)"
+
+            # Format as markdown table for better chat display
+            if as_markdown_table:
+                # Add database_id to the table output
+                table_output = self._format_database_as_markdown_table(
+                    db_title, columns, schema, entries
+                )
+                # Insert database_id after the title line
+                lines = table_output.split("\n")
+                if lines:
+                    lines.insert(1, f"**Database ID**: `{normalized_id}` (use for updates)")
+                return "\n".join(lines)
+
+            # Fallback: plain text format
+            lines = [
+                f"📊 Database: {db_title}",
+                f"**Database ID**: `{normalized_id}` (use for updates)",
+                f"Columns: {', '.join(columns)}",
+                f"Total entries: {len(entries)}",
+                "",
+            ]
+
+            for i, entry in enumerate(entries, 1):
+                formatted = self.notion_client.format_database_entry(entry)
+                props = formatted["properties"]
+                title_val = props.get(title_col) if title_col else "Untitled"
+                lines.append(f"\n**Entry {i}: {title_val}** (ID: {formatted['id'][:8]}...)")
+
+                for col in columns:
+                    val = props.get(col)
+                    if val is not None and val != "" and val != []:
+                        if isinstance(val, list):
+                            val_str = ", ".join(str(v) for v in val)
+                        else:
+                            val_str = str(val)
+                        lines.append(f"  - {col}: {val_str}")
+
+            return "\n".join(lines)
+
+        except Exception as e:
+            logger.error(f"Error getting database content: {e}", exc_info=True)
+            return f"❌ Error: {str(e)}"
+
+    def find_notion_entry(self, search_text: str, database_hint: Optional[str] = None) -> str:
+        """POWERFUL SEARCH: Find a database entry by name across ALL databases.
+        
+        This is the BEST way to find an entry when you don't know which database it's in.
+        Returns the entry with ALL details needed for updates (database_id, entry_id, properties).
+        
+        Args:
+            search_text: The entry name to search for (e.g., "CloudFactory", "Alegion", "CCHP Health Plan")
+            database_hint: Optional hint for which database to search first (e.g., "Yash Exploration")
+        
+        Returns:
+            Entry details with database_id and entry_id ready for updates
+        """
+        try:
+            if not self.notion_client or not self.notion_client.test_connection():
+                return "❌ Notion not connected"
+            
+            search_lower = search_text.lower()
+            found_entries = []
+            
+            # Get all databases
+            databases = self.notion_client.search(
+                query="",
+                filter_type="database",
+                max_results=50
+            )
+            
+            # If database_hint provided, prioritize matching databases
+            if database_hint:
+                hint_lower = database_hint.lower()
+                prioritized = []
+                others = []
+                for db in databases:
+                    title = "".join(t.get("plain_text", "") for t in db.get("title", []))
+                    if hint_lower in title.lower():
+                        prioritized.append(db)
+                    else:
+                        others.append(db)
+                databases = prioritized + others
+            
+            for db in databases[:20]:  # Limit to first 20 databases
+                db_id = db.get("id")
+                db_title = "".join(t.get("plain_text", "") for t in db.get("title", []))
+                
+                if not db_id:
+                    continue
+                
+                # Query this database
+                try:
+                    entries = self.notion_client.query_database(db_id, max_results=200)
+                    
+                    # Get schema for title column
+                    schema = db.get("properties", {})
+                    title_col = None
+                    for col_name, col_schema in schema.items():
+                        if col_schema.get("type") == "title":
+                            title_col = col_name
+                            break
+                    
+                    for entry in entries:
+                        formatted = self.notion_client.format_database_entry(entry)
+                        props = formatted["properties"]
+                        
+                        # Check if search_text matches any property
+                        for col, val in props.items():
+                            if val and search_lower in str(val).lower():
+                                found_entries.append({
+                                    "database_id": db_id,
+                                    "database_title": db_title,
+                                    "entry_id": entry.get("id"),
+                                    "entry_title": props.get(title_col, "Entry") if title_col else "Entry",
+                                    "properties": props,
+                                    "title_col": title_col,
+                                })
+                                break
+                except Exception as db_err:
+                    logger.debug(f"Could not query database {db_id}: {db_err}")
+                    continue
+                
+                # If we found matches, don't search more databases
+                if found_entries:
+                    break
+            
+            if not found_entries:
+                return f"❌ Could not find any entry matching '{search_text}' in your Notion databases."
+            
+            # Format output with all needed IDs
+            lines = [
+                f"## ✅ Found {len(found_entries)} match(es) for '{search_text}'",
+                "",
+            ]
+            
+            for entry in found_entries[:5]:  # Show max 5 matches
+                lines.append(f"### {entry['entry_title']}")
+                lines.append(f"- **Database**: {entry['database_title']}")
+                lines.append(f"- **Database ID**: `{entry['database_id']}`")
+                lines.append(f"- **Entry ID**: `{entry['entry_id']}`")
+                lines.append("")
+                lines.append("**Properties:**")
+                for prop_name, prop_val in entry["properties"].items():
+                    if prop_val is not None and prop_val != "" and prop_val != []:
+                        lines.append(f"- **{prop_name}**: {prop_val}")
+                lines.append("")
+                lines.append("---")
+            
+            # Add update instructions
+            if found_entries:
+                entry = found_entries[0]
+                lines.append("")
+                lines.append("💡 **To update this entry**, use `update_notion_entry_by_name` with:")
+                lines.append(f"- `database_id`: `{entry['database_id']}`")
+                lines.append(f"- `entry_name`: `{entry['entry_title']}`")
+                lines.append("- `property_name`: (the property you want to change)")
+                lines.append("- `new_value`: (the new value)")
+            
+            return "\n".join(lines)
+            
+        except Exception as e:
+            logger.error(f"Error finding Notion entry: {e}", exc_info=True)
+            return f"❌ Error: {str(e)}"
+
+    def list_notion_databases(self, title_filter: Optional[str] = None) -> str:
+        """List all databases in the Notion workspace.
+        
+        Use this to find the correct database ID before querying.
+        This returns ORIGINAL databases (not linked views).
+        
+        Args:
+            title_filter: Optional filter to search by title (case-insensitive)
+            
+        Returns:
+            List of databases with their IDs and titles
+        """
+        try:
+            if not self.notion_client or not self.notion_client.test_connection():
+                return "❌ Notion not connected"
+
+            databases = self.notion_client.search_databases(title_filter)
+            
+            if not databases:
+                if title_filter:
+                    return f"No databases found matching '{title_filter}'"
+                return "No databases found in the workspace"
+
+            lines = [
+                f"## 📊 Found {len(databases)} database(s)" + (f" matching '{title_filter}'" if title_filter else ""),
+                "",
+            ]
+
+            for db in databases:
+                db_id = db.get("id", "")
+                title_parts = db.get("title", [])
+                title = "".join(t.get("plain_text", "") for t in title_parts) or "Untitled"
+                
+                # Get entry count
+                try:
+                    entries = self.notion_client.query_database(db_id, max_results=1)
+                    # Just check if there are entries
+                    has_entries = "✓" if entries else "○"
+                except:
+                    has_entries = "?"
+                
+                lines.append(f"- **{title}** {has_entries}")
+                lines.append(f"  ID: `{db_id}`")
+
+            lines.append("")
+            lines.append("*Use the database ID to query entries with `get_notion_database_content`*")
+            
+            return "\n".join(lines)
+
+        except Exception as e:
+            logger.error(f"Error listing databases: {e}", exc_info=True)
+            return f"❌ Error: {str(e)}"
+
+    def _format_database_as_markdown_table(
+        self,
+        db_title: str,
+        columns: List[str],
+        schema: Dict[str, Any],
+        entries: List[Dict[str, Any]],
+        max_columns: int = 15,
+    ) -> str:
+        """Format database entries as a markdown table for chat display.
+        
+        Shows ALL columns up to max_columns. Remaining columns are shown in JSON format.
+        """
+        # Show more columns but still limit for table width
+        display_columns = columns[:max_columns]
+        remaining_columns = columns[max_columns:] if len(columns) > max_columns else []
+
+        lines = [
+            f"## 📊 {db_title}",
+            f"*{len(entries)} entries found* | *{len(columns)} columns total*",
+            "",
+        ]
+
+        # Build table header
+        header = "| " + " | ".join(display_columns) + " |"
+        separator = "| " + " | ".join(["---"] * len(display_columns)) + " |"
+        lines.append(header)
+        lines.append(separator)
+
+        # Build table rows
+        for entry in entries:
+            formatted = self.notion_client.format_database_entry(entry)
+            props = formatted["properties"]
+
+            row_cells = []
+            for col in display_columns:
+                val = props.get(col)
+                if val is None or val == "" or val == []:
+                    cell = "-"
+                elif isinstance(val, list):
+                    cell = ", ".join(str(v)[:30] for v in val[:3])
+                    if len(val) > 3:
+                        cell += "..."
+                elif isinstance(val, (int, float)):
+                    # Format numbers nicely
+                    if isinstance(val, float) and val >= 1000:
+                        cell = f"${val:,.2f}" if "Estim" in col or "price" in col.lower() else f"{val:,.2f}"
+                    else:
+                        cell = str(val)
+                else:
+                    cell = str(val)[:100]
+                    if len(str(val)) > 100:
+                        cell += "..."
+                # Escape pipe characters in cells
+                cell = cell.replace("|", "\\|").replace("\n", " ")
+                row_cells.append(cell)
+
+            lines.append("| " + " | ".join(row_cells) + " |")
+
+        # If there are remaining columns, show them as JSON for each entry
+        if remaining_columns:
+            lines.append("")
+            lines.append(f"### Additional Columns ({', '.join(remaining_columns)})")
+            lines.append("```json")
+            import json
+            for entry in entries[:20]:  # Limit to first 20 for JSON
+                formatted = self.notion_client.format_database_entry(entry)
+                props = formatted["properties"]
+                # Get title/name for identification
+                title_val = None
+                for col in display_columns[:1]:  # First column is usually title
+                    title_val = props.get(col, "Entry")
+                    break
+                extra_data = {col: props.get(col) for col in remaining_columns if props.get(col)}
+                if extra_data:
+                    lines.append(f'{{"name": "{title_val}", {json.dumps(extra_data)[1:]}')
+            lines.append("```")
+            if len(entries) > 20:
+                lines.append(f"*(Showing additional columns for first 20 of {len(entries)} entries)*")
+
+        return "\n".join(lines)
+
+    def update_notion_database_entry(
+        self,
+        entry_id: str,
+        property_name: str,
+        new_value: Any,
+        property_type: Optional[str] = None,
+    ) -> str:
+        """Update a specific property of a Notion database entry.
+
+        Args:
+            entry_id: The entry/page ID to update
+            property_name: The name of the property/column to update
+            new_value: The new value to set
+            property_type: Optional property type hint (title, rich_text, number, 
+                          select, status, date, checkbox, url, email). If not provided,
+                          will try to auto-detect.
+
+        Returns:
+            Success or error message
+        """
+        try:
+            if not self.notion_client or not self.notion_client.test_connection():
+                return "❌ Notion not connected"
+
+            normalized_id = _normalize_notion_id(entry_id)
+            if not normalized_id:
+                return "❌ Invalid entry_id. Please pass a Notion page ID or full Notion URL."
+
+            import requests
+            headers = {
+                "Authorization": f"Bearer {Config.NOTION_TOKEN}",
+                "Notion-Version": "2022-06-28",
+            }
+
+            # Get the page to find its parent database and determine property type
+            resp = requests.get(
+                f"https://api.notion.com/v1/pages/{normalized_id}",
+                headers=headers,
+            )
+            if resp.status_code != 200:
+                return f"❌ Could not find entry {entry_id}"
+
+            page_data = resp.json()
+            parent = page_data.get("parent", {})
+
+            # If it's a database item, get the database schema
+            if parent.get("type") == "database_id":
+                db_id = parent.get("database_id")
+                db_meta = self.notion_client.get_database(db_id)
+                if db_meta:
+                    schema = db_meta.get("properties", {})
+                    if property_name not in schema:
+                        available = ", ".join(schema.keys())
+                        return f"❌ Property '{property_name}' not found. Available: {available}"
+
+                    # Auto-detect property type if not provided
+                    if not property_type:
+                        property_type = schema[property_name].get("type")
+
+            if not property_type:
+                property_type = "rich_text"  # Default fallback
+
+            # Build the property update
+            prop_update = self.notion_client.build_property_update(property_type, new_value)
+            if not prop_update:
+                return f"❌ Property type '{property_type}' is not supported for updates"
+
+            # Update the entry
+            properties = {property_name: prop_update}
+            result = self.notion_client.update_database_entry(normalized_id, properties)
+
+            if result:
+                return f"✅ Updated '{property_name}' to '{new_value}' for entry {normalized_id}"
+            else:
+                return f"❌ Failed to update entry. Check that you have edit access."
+
+        except Exception as e:
+            logger.error(f"Error updating database entry: {e}", exc_info=True)
+            return f"❌ Error: {str(e)}"
+
     def get_notion_page_content(
         self,
         page_id: str,
@@ -1407,7 +1957,11 @@ class WorkforceTools:
         max_depth: int = 3,
         max_blocks: int = 500,
     ) -> str:
-        """Get flattened text content of a Notion page.
+        """Get flattened text content of a Notion page OR database.
+
+        This function automatically detects if the page_id refers to a database
+        and returns the database entries with all properties. For regular pages,
+        it returns the text content of blocks.
 
         Uses the Notion blocks API (GET /v1/blocks/:id/children) with
         pagination and optional recursion into child pages to build a
@@ -1422,6 +1976,16 @@ class WorkforceTools:
 
             if not Config.NOTION_TOKEN:
                 return "❌ NOTION_TOKEN is not configured. Please set it in your environment."
+
+            normalized_id = _normalize_notion_id(page_id)
+            if not normalized_id:
+                return "❌ Invalid Notion page_id. Please pass a Notion page ID or full Notion URL."
+
+            # First check if this is a database
+            db_meta = self.notion_client.get_database(normalized_id)
+            if db_meta:
+                # It's a database! Use the database content function with full entries
+                return self.get_notion_database_content(normalized_id, max_entries=500)
 
             normalized_id = _normalize_notion_id(page_id)
             if not normalized_id:
@@ -1484,6 +2048,224 @@ class WorkforceTools:
                             return
 
                         btype = block.get("type")
+
+                        # Handle child_database blocks - query them directly
+                        # Note: Linked databases cannot be queried, must find original
+                        if btype == "child_database":
+                            db_id = block.get("id")
+                            db_title = block.get("child_database", {}).get("title", "Database")
+                            if db_id:
+                                text_lines.append("")
+                                text_lines.append(f"## 📊 Database: {db_title}")
+                                text_lines.append(f"**Database ID**: `{db_id}` (use for updates)")
+                                # Try to query the database
+                                try:
+                                    # First try querying the block ID directly
+                                    entries = self.notion_client.query_database(db_id, max_results=500)
+                                    
+                                    # If no entries, this might be a LINKED database view
+                                    # Search for the original database by title
+                                    if not entries and db_title:
+                                        logger.info(f"No entries found for {db_id}, searching for original database '{db_title}'")
+                                        original_db = self.notion_client.find_database_by_title(db_title)
+                                        if original_db:
+                                            original_id = original_db.get("id")
+                                            if original_id and original_id != db_id:
+                                                logger.info(f"Found original database {original_id}")
+                                                db_id = original_id
+                                                text_lines.append(f"**Original Database ID**: `{db_id}` (use this for updates)")
+                                                entries = self.notion_client.query_database(db_id, max_results=500)
+                                    
+                                    if entries:
+                                        db_meta = self.notion_client.get_database(db_id)
+                                        if db_meta:
+                                            schema = db_meta.get("properties", {})
+                                            # Order columns: title first, then others
+                                            title_col = None
+                                            other_cols = []
+                                            for col_name, col_schema in schema.items():
+                                                if col_schema.get("type") == "title":
+                                                    title_col = col_name
+                                                else:
+                                                    other_cols.append(col_name)
+                                            ordered_columns = ([title_col] if title_col else []) + sorted(other_cols)
+                                            
+                                            table_content = self._format_database_as_markdown_table(
+                                                db_title, ordered_columns, schema, entries
+                                            )
+                                            # Skip the title line since we already added it
+                                            table_lines = table_content.split("\n")
+                                            for i, line in enumerate(table_lines):
+                                                if line.startswith("|"):
+                                                    text_lines.extend(table_lines[i:])
+                                                    break
+                                        else:
+                                            text_lines.append(f"*{len(entries)} entries found*")
+                                    else:
+                                        text_lines.append("*No entries found or database not accessible*")
+                                        text_lines.append("(This may be a linked database - ensure the original is shared with the integration)")
+                                except Exception as db_err:
+                                    logger.warning(f"Could not query child database {db_id}: {db_err}")
+                                    text_lines.append(f"(Could not load database content: {db_err})")
+                            continue
+
+                        # Handle image blocks
+                        if btype == "image":
+                            image_data = block.get("image", {})
+                            image_type = image_data.get("type")  # "file" or "external"
+                            url = None
+                            if image_type == "file":
+                                url = image_data.get("file", {}).get("url")
+                            elif image_type == "external":
+                                url = image_data.get("external", {}).get("url")
+                            caption = render_rich_text(image_data.get("caption", []))
+                            if url:
+                                text_lines.append(f"📷 Image: {caption or 'Image'}")
+                                text_lines.append(f"   URL: {url}")
+                            continue
+
+                        # Handle file blocks
+                        if btype == "file":
+                            file_data = block.get("file", {})
+                            file_type = file_data.get("type")
+                            url = None
+                            name = file_data.get("name", "File")
+                            if file_type == "file":
+                                url = file_data.get("file", {}).get("url")
+                            elif file_type == "external":
+                                url = file_data.get("external", {}).get("url")
+                            caption = render_rich_text(file_data.get("caption", []))
+                            text_lines.append(f"📎 File: {name}")
+                            if url:
+                                text_lines.append(f"   URL: {url}")
+                            continue
+
+                        # Handle video blocks
+                        if btype == "video":
+                            video_data = block.get("video", {})
+                            video_type = video_data.get("type")
+                            url = None
+                            if video_type == "file":
+                                url = video_data.get("file", {}).get("url")
+                            elif video_type == "external":
+                                url = video_data.get("external", {}).get("url")
+                            caption = render_rich_text(video_data.get("caption", []))
+                            text_lines.append(f"🎬 Video: {caption or 'Video'}")
+                            if url:
+                                text_lines.append(f"   URL: {url}")
+                            continue
+
+                        # Handle PDF blocks
+                        if btype == "pdf":
+                            pdf_data = block.get("pdf", {})
+                            pdf_type = pdf_data.get("type")
+                            url = None
+                            if pdf_type == "file":
+                                url = pdf_data.get("file", {}).get("url")
+                            elif pdf_type == "external":
+                                url = pdf_data.get("external", {}).get("url")
+                            caption = render_rich_text(pdf_data.get("caption", []))
+                            text_lines.append(f"📄 PDF: {caption or 'PDF Document'}")
+                            if url:
+                                text_lines.append(f"   URL: {url}")
+                            continue
+
+                        # Handle embed blocks (links, embeds)
+                        if btype == "embed":
+                            embed_data = block.get("embed", {})
+                            url = embed_data.get("url", "")
+                            caption = render_rich_text(embed_data.get("caption", []))
+                            if url:
+                                text_lines.append(f"🔗 Embed: {caption or url}")
+                                text_lines.append(f"   URL: {url}")
+                            continue
+
+                        # Handle bookmark blocks
+                        if btype == "bookmark":
+                            bookmark_data = block.get("bookmark", {})
+                            url = bookmark_data.get("url", "")
+                            caption = render_rich_text(bookmark_data.get("caption", []))
+                            if url:
+                                text_lines.append(f"🔖 Bookmark: {caption or url}")
+                                text_lines.append(f"   URL: {url}")
+                            continue
+
+                        # Handle code blocks
+                        if btype == "code":
+                            code_data = block.get("code", {})
+                            language = code_data.get("language", "")
+                            code_text = render_rich_text(code_data.get("rich_text", []))
+                            text_lines.append(f"```{language}")
+                            text_lines.append(code_text)
+                            text_lines.append("```")
+                            continue
+
+                        # Handle callout blocks
+                        if btype == "callout":
+                            callout_data = block.get("callout", {})
+                            icon = callout_data.get("icon", {})
+                            emoji = icon.get("emoji", "💡") if icon.get("type") == "emoji" else "💡"
+                            text = render_rich_text(callout_data.get("rich_text", []))
+                            text_lines.append(f"{emoji} {text}")
+                            continue
+
+                        # Handle table blocks (inline tables, not databases)
+                        if btype == "table":
+                            table_data = block.get("table", {})
+                            has_col_header = table_data.get("has_column_header", False)
+                            text_lines.append("")
+                            text_lines.append("📋 Table:")
+                            # Fetch table rows directly since they are children of the table block
+                            table_id = block.get("id")
+                            if table_id:
+                                try:
+                                    table_resp = requests.get(
+                                        f"https://api.notion.com/v1/blocks/{table_id}/children",
+                                        headers=headers,
+                                        timeout=30,
+                                    )
+                                    if table_resp.status_code == 200:
+                                        table_data = table_resp.json()
+                                        table_rows = table_data.get("results", [])
+                                        is_first_row = True
+                                        for row in table_rows:
+                                            if row.get("type") == "table_row":
+                                                cells = row.get("table_row", {}).get("cells", [])
+                                                row_text = " | ".join(
+                                                    render_rich_text(cell) for cell in cells
+                                                )
+                                                text_lines.append(f"| {row_text} |")
+                                                # Add separator after header row
+                                                if is_first_row and has_col_header:
+                                                    sep = " | ".join(["---"] * len(cells))
+                                                    text_lines.append(f"| {sep} |")
+                                                is_first_row = False
+                                except Exception as e:
+                                    logger.warning(f"Could not fetch table rows: {e}")
+                            continue
+
+                        # Handle table_row blocks
+                        if btype == "table_row":
+                            row_data = block.get("table_row", {})
+                            cells = row_data.get("cells", [])
+                            row_text = " | ".join(
+                                render_rich_text(cell) for cell in cells
+                            )
+                            text_lines.append(f"| {row_text} |")
+                            continue
+
+                        # Handle divider blocks
+                        if btype == "divider":
+                            text_lines.append("---")
+                            continue
+
+                        # Handle link_preview blocks
+                        if btype == "link_preview":
+                            preview_data = block.get("link_preview", {})
+                            url = preview_data.get("url", "")
+                            if url:
+                                text_lines.append(f"🔗 Link: {url}")
+                            continue
 
                         # Render text-like blocks
                         if btype in TEXT_BLOCK_TYPES:
@@ -1744,98 +2526,118 @@ class WorkforceTools:
         self,
         database_id: str,
         filter_json: Optional[str] = None,
-        page_size: int = 10
+        page_size: int = 100,
+        search_text: Optional[str] = None,
     ) -> str:
-        """Query a Notion database and list matching rows.
+        """Query a Notion database and list matching rows with ALL properties.
         
         Args:
             database_id: ID of the Notion database to query
             filter_json: Optional Notion filter object as JSON string
-            page_size: Maximum number of rows to return
+            page_size: Maximum number of rows to return (default 100)
+            search_text: Optional text to search for in entry names/titles
         """
         try:
-            import requests
-            
-            if not Config.NOTION_TOKEN:
-                return "❌ NOTION_TOKEN is not configured. Please set it in your environment."
-            
-            headers = {
-                "Authorization": f"Bearer {Config.NOTION_TOKEN}",
-                "Notion-Version": "2022-06-28",
-                "Content-Type": "application/json",
-            }
-            
-            payload: Dict[str, Any] = {
-                "page_size": min(max(page_size, 1), 100),
-            }
-            
+            if not self.notion_client or not self.notion_client.test_connection():
+                return "❌ Notion not connected"
+
+            normalized_id = _normalize_notion_id(database_id)
+            if not normalized_id:
+                return "❌ Invalid database_id. Please pass a Notion database ID or full Notion URL."
+
+            # Get database metadata for title and schema
+            db_meta = self.notion_client.get_database(normalized_id)
+            if not db_meta:
+                return f"❌ Could not find database {database_id}. Make sure the Notion integration has access to it."
+
+            # Get database title
+            title_parts = db_meta.get("title", [])
+            db_title = "".join(t.get("plain_text", "") for t in title_parts) or "Untitled Database"
+
+            # Get schema
+            schema = db_meta.get("properties", {})
+            columns = list(schema.keys())
+
+            # Build filter if provided
+            filter_obj = None
             if filter_json:
                 try:
-                    payload["filter"] = json.loads(filter_json)
+                    filter_obj = json.loads(filter_json)
                 except json.JSONDecodeError:
                     return "❌ Invalid filter_json. It must be valid JSON representing a Notion filter object."
-            
-            response = requests.post(
-                f"https://api.notion.com/v1/databases/{database_id}/query",
-                headers=headers,
-                json=payload,
-            )
-            
-            if response.status_code != 200:
-                logger.error(f"Notion database query error {response.status_code}: {response.text}")
-                return f"❌ Notion API error {response.status_code}: {response.text[:200]}"
-            
-            data = response.json()
-            results = data.get("results", [])
-            
-            if not results:
-                return "No rows found for this database query."
-            
-            lines = [
-                f"🔍 Rows in database {database_id} (showing up to {min(len(results), page_size)}):"
-            ]
-            
-            for page in results[:page_size]:
-                props = page.get("properties", {}) or {}
-                title = "Untitled"
-                title_prop = props.get("Name") or props.get("title") or {}
-                title_array = title_prop.get("title") or []
-                if title_array:
-                    title = title_array[0].get("plain_text", title)
-                
-                summary_parts = []
-                for name, prop in list(props.items())[:5]:
-                    prop_type = prop.get("type")
-                    value_str = ""
-                    if prop_type == "title":
-                        texts = prop.get("title") or []
-                        if texts:
-                            value_str = texts[0].get("plain_text", "")
-                    elif prop_type == "rich_text":
-                        texts = prop.get("rich_text") or []
-                        if texts:
-                            value_str = texts[0].get("plain_text", "")
-                    elif prop_type == "select":
-                        sel = prop.get("select") or {}
-                        value_str = sel.get("name", "")
-                    elif prop_type == "status":
-                        st = prop.get("status") or {}
-                        value_str = st.get("name", "")
-                    elif prop_type == "checkbox":
-                        value_str = str(prop.get("checkbox"))
-                    elif prop_type == "number":
-                        value_str = str(prop.get("number"))
-                    
-                    if value_str:
-                        summary_parts.append(f"{name}: {value_str}")
-                
-                summary = "; ".join(summary_parts)
-                if summary:
-                    lines.append(f"• {title} (Page ID: {page['id']}) — {summary}")
+
+            # Order columns: title first, then others
+            title_col = None
+            other_cols = []
+            for col_name, col_schema in schema.items():
+                if col_schema.get("type") == "title":
+                    title_col = col_name
                 else:
-                    lines.append(f"• {title} (Page ID: {page['id']})")
-            
-            return "\n".join(lines)
+                    other_cols.append(col_name)
+            ordered_columns = ([title_col] if title_col else []) + sorted(other_cols)
+
+            # Query database using the client's comprehensive method
+            entries = self.notion_client.query_database(
+                normalized_id,
+                filter_obj=filter_obj,
+                max_results=min(max(page_size, 1), 500),  # Get up to 500 entries
+            )
+
+            if not entries:
+                return f"📊 **Database: {db_title}**\n\nNo entries found."
+
+            # If search_text provided, filter entries and show full details for matches
+            if search_text:
+                search_lower = search_text.lower()
+                matching_entries = []
+                for entry in entries:
+                    formatted = self.notion_client.format_database_entry(entry)
+                    props = formatted["properties"]
+                    # Check if search text matches any property value
+                    for col, val in props.items():
+                        if val and search_lower in str(val).lower():
+                            matching_entries.append(entry)
+                            break
+                
+                if not matching_entries:
+                    return f"📊 **Database: {db_title}**\n\nNo entries matching '{search_text}' found."
+                
+                # Show full details for matching entries - include DATABASE_ID prominently for updates
+                lines = [
+                    f"## 📊 {db_title}",
+                    f"**Database ID**: `{normalized_id}` (use this for updates)",
+                    f"*Found {len(matching_entries)} entries matching '{search_text}'*",
+                    "",
+                ]
+                for entry in matching_entries:
+                    formatted = self.notion_client.format_database_entry(entry)
+                    props = formatted["properties"]
+                    # Get entry title
+                    entry_title = props.get(title_col, "Entry") if title_col else "Entry"
+                    lines.append(f"### {entry_title}")
+                    lines.append(f"**Entry ID**: `{entry.get('id')}`")
+                    lines.append("")
+                    # Show properties in a readable format, not JSON
+                    lines.append("**Properties:**")
+                    for prop_name, prop_val in props.items():
+                        if prop_val is not None and prop_val != "" and prop_val != []:
+                            lines.append(f"- **{prop_name}**: {prop_val}")
+                    lines.append("")
+                    lines.append("---")
+                
+                lines.append("")
+                lines.append("💡 **To update**: Use `update_notion_entry_by_name` with:")
+                lines.append(f"- database_id: `{normalized_id}`")
+                lines.append(f"- entry_name: (entry name from above)")
+                lines.append("- property_name: (property to change)")
+                lines.append("- new_value: (new value)")
+                
+                return "\n".join(lines)
+
+            # Use markdown table format for better chat display
+            return self._format_database_as_markdown_table(
+                db_title, ordered_columns, schema, entries
+            )
         except Exception as e:
             logger.error(f"Error querying Notion database: {e}", exc_info=True)
             return f"❌ Error querying Notion database: {str(e)}"
@@ -1878,6 +2680,335 @@ class WorkforceTools:
         except Exception as e:
             logger.error(f"Error updating Notion database item: {e}", exc_info=True)
             return f"❌ Error updating Notion database item: {str(e)}"
+
+    def update_notion_entry_by_name(
+        self,
+        database_id: str,
+        entry_name: str,
+        property_name: str,
+        new_value: Any,
+        property_type: Optional[str] = None,
+    ) -> str:
+        """Find a database entry by name/title and update a specific property.
+        
+        This is the easiest way to update Notion database entries - just specify the
+        entry name, property to update, and the new value.
+        
+        Args:
+            database_id: The database ID or URL containing the entry
+            entry_name: The name/title of the entry to find (e.g., "Alegion", "CCHP Health Plan")
+            property_name: The property/column name to update (e.g., "Estimated Value Annually")
+            new_value: The new value to set (number, string, date, etc.)
+            property_type: Optional hint for property type (number, text, select, date, checkbox, url)
+        
+        Returns:
+            Success message with updated entry details or error message
+        """
+        try:
+            import requests
+            
+            if not self.notion_client or not self.notion_client.test_connection():
+                return "❌ Notion not connected"
+            
+            if not Config.NOTION_TOKEN:
+                return "❌ NOTION_TOKEN is not configured."
+            
+            normalized_id = _normalize_notion_id(database_id)
+            if not normalized_id:
+                return "❌ Invalid database_id."
+            
+            # Get database schema to understand property types
+            db_meta = self.notion_client.get_database(normalized_id)
+            if not db_meta:
+                return f"❌ Could not find database {database_id}"
+            
+            schema = db_meta.get("properties", {})
+            
+            # Find the title column
+            title_col = None
+            for col_name, col_schema in schema.items():
+                if col_schema.get("type") == "title":
+                    title_col = col_name
+                    break
+            
+            # Query database to find the entry
+            entries = self.notion_client.query_database(normalized_id, max_results=500)
+            
+            if not entries:
+                return f"❌ No entries found in database"
+            
+            # Find matching entry by name
+            matching_entry = None
+            entry_name_lower = entry_name.lower()
+            for entry in entries:
+                formatted = self.notion_client.format_database_entry(entry)
+                props = formatted["properties"]
+                
+                # Check title column
+                if title_col:
+                    title_val = props.get(title_col, "")
+                    if title_val and entry_name_lower in str(title_val).lower():
+                        matching_entry = entry
+                        break
+                
+                # Also check any text property that contains the name
+                for col, val in props.items():
+                    if val and entry_name_lower in str(val).lower():
+                        matching_entry = entry
+                        break
+                if matching_entry:
+                    break
+            
+            if not matching_entry:
+                return f"❌ Could not find entry '{entry_name}' in database"
+            
+            entry_id = matching_entry.get("id")
+            if not entry_id:
+                return f"❌ Entry found but has no ID"
+            
+            # Get the property schema to determine type
+            prop_schema = schema.get(property_name, {})
+            detected_type = prop_schema.get("type") or property_type or "rich_text"
+            
+            # Build the proper Notion property update payload
+            properties_payload = {}
+            
+            if detected_type == "number":
+                try:
+                    num_val = float(new_value) if "." in str(new_value) else int(new_value)
+                except (ValueError, TypeError):
+                    num_val = new_value
+                properties_payload[property_name] = {"number": num_val}
+                
+            elif detected_type == "rich_text":
+                properties_payload[property_name] = {
+                    "rich_text": [{"text": {"content": str(new_value)}}]
+                }
+                
+            elif detected_type == "title":
+                properties_payload[property_name] = {
+                    "title": [{"text": {"content": str(new_value)}}]
+                }
+                
+            elif detected_type == "select":
+                properties_payload[property_name] = {"select": {"name": str(new_value)}}
+                
+            elif detected_type == "status":
+                properties_payload[property_name] = {"status": {"name": str(new_value)}}
+                
+            elif detected_type == "multi_select":
+                if isinstance(new_value, list):
+                    properties_payload[property_name] = {
+                        "multi_select": [{"name": str(v)} for v in new_value]
+                    }
+                else:
+                    properties_payload[property_name] = {
+                        "multi_select": [{"name": str(new_value)}]
+                    }
+                    
+            elif detected_type == "checkbox":
+                bool_val = new_value if isinstance(new_value, bool) else str(new_value).lower() in ("true", "yes", "1")
+                properties_payload[property_name] = {"checkbox": bool_val}
+                
+            elif detected_type == "url":
+                properties_payload[property_name] = {"url": str(new_value)}
+                
+            elif detected_type == "email":
+                properties_payload[property_name] = {"email": str(new_value)}
+                
+            elif detected_type == "phone_number":
+                properties_payload[property_name] = {"phone_number": str(new_value)}
+                
+            elif detected_type == "date":
+                # Handle date - expect ISO format or simple date string
+                date_str = str(new_value)
+                properties_payload[property_name] = {"date": {"start": date_str}}
+                
+            else:
+                # Default to rich_text
+                properties_payload[property_name] = {
+                    "rich_text": [{"text": {"content": str(new_value)}}]
+                }
+            
+            # Execute the update
+            response = requests.patch(
+                f"https://api.notion.com/v1/pages/{entry_id}",
+                headers={
+                    "Authorization": f"Bearer {Config.NOTION_TOKEN}",
+                    "Notion-Version": "2022-06-28",
+                    "Content-Type": "application/json",
+                },
+                json={"properties": properties_payload},
+                timeout=30,
+            )
+            
+            if response.status_code == 200:
+                # Get the entry name for confirmation
+                formatted = self.notion_client.format_database_entry(matching_entry)
+                entry_title = formatted["properties"].get(title_col, entry_name) if title_col else entry_name
+                return f"✅ Updated '{entry_title}':\n- **{property_name}**: {new_value}\n- Entry ID: `{entry_id}`"
+            else:
+                error_text = response.text[:300]
+                logger.error(f"Notion update error {response.status_code}: {error_text}")
+                return f"❌ Notion API error {response.status_code}: {error_text}"
+                
+        except Exception as e:
+            logger.error(f"Error updating Notion entry: {e}", exc_info=True)
+            return f"❌ Error: {str(e)}"
+    
+    def add_notion_database_entry(
+        self,
+        database_id: str,
+        properties: Dict[str, Any],
+    ) -> str:
+        """Add a new entry/row to a Notion database.
+        
+        Args:
+            database_id: The database ID or URL to add entry to
+            properties: Dict of property names to values (e.g., {"Name": "New Project", "Status": "Active"})
+        
+        Returns:
+            Success message with new entry ID or error
+        """
+        try:
+            import requests
+            
+            if not self.notion_client or not self.notion_client.test_connection():
+                return "❌ Notion not connected"
+            
+            if not Config.NOTION_TOKEN:
+                return "❌ NOTION_TOKEN is not configured."
+            
+            normalized_id = _normalize_notion_id(database_id)
+            if not normalized_id:
+                return "❌ Invalid database_id."
+            
+            # Get database schema
+            db_meta = self.notion_client.get_database(normalized_id)
+            if not db_meta:
+                return f"❌ Could not find database {database_id}"
+            
+            schema = db_meta.get("properties", {})
+            
+            # Build properties payload based on schema
+            properties_payload = {}
+            for prop_name, prop_value in properties.items():
+                if prop_name not in schema:
+                    continue
+                    
+                prop_type = schema[prop_name].get("type")
+                
+                if prop_type == "title":
+                    properties_payload[prop_name] = {
+                        "title": [{"text": {"content": str(prop_value)}}]
+                    }
+                elif prop_type == "rich_text":
+                    properties_payload[prop_name] = {
+                        "rich_text": [{"text": {"content": str(prop_value)}}]
+                    }
+                elif prop_type == "number":
+                    try:
+                        num_val = float(prop_value) if "." in str(prop_value) else int(prop_value)
+                    except (ValueError, TypeError):
+                        num_val = prop_value
+                    properties_payload[prop_name] = {"number": num_val}
+                elif prop_type == "select":
+                    properties_payload[prop_name] = {"select": {"name": str(prop_value)}}
+                elif prop_type == "status":
+                    properties_payload[prop_name] = {"status": {"name": str(prop_value)}}
+                elif prop_type == "multi_select":
+                    if isinstance(prop_value, list):
+                        properties_payload[prop_name] = {
+                            "multi_select": [{"name": str(v)} for v in prop_value]
+                        }
+                    else:
+                        properties_payload[prop_name] = {
+                            "multi_select": [{"name": str(prop_value)}]
+                        }
+                elif prop_type == "checkbox":
+                    bool_val = prop_value if isinstance(prop_value, bool) else str(prop_value).lower() in ("true", "yes", "1")
+                    properties_payload[prop_name] = {"checkbox": bool_val}
+                elif prop_type == "url":
+                    properties_payload[prop_name] = {"url": str(prop_value)}
+                elif prop_type == "email":
+                    properties_payload[prop_name] = {"email": str(prop_value)}
+                elif prop_type == "date":
+                    properties_payload[prop_name] = {"date": {"start": str(prop_value)}}
+                else:
+                    # Default to rich_text
+                    properties_payload[prop_name] = {
+                        "rich_text": [{"text": {"content": str(prop_value)}}]
+                    }
+            
+            # Create the page (entry)
+            response = requests.post(
+                "https://api.notion.com/v1/pages",
+                headers={
+                    "Authorization": f"Bearer {Config.NOTION_TOKEN}",
+                    "Notion-Version": "2022-06-28",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "parent": {"database_id": normalized_id},
+                    "properties": properties_payload,
+                },
+                timeout=30,
+            )
+            
+            if response.status_code == 200:
+                new_entry = response.json()
+                entry_id = new_entry.get("id")
+                return f"✅ Created new database entry!\n- Entry ID: `{entry_id}`\n- Properties: {list(properties.keys())}"
+            else:
+                error_text = response.text[:300]
+                logger.error(f"Notion create error {response.status_code}: {error_text}")
+                return f"❌ Notion API error {response.status_code}: {error_text}"
+                
+        except Exception as e:
+            logger.error(f"Error creating Notion entry: {e}", exc_info=True)
+            return f"❌ Error: {str(e)}"
+    
+    def delete_notion_database_entry(self, entry_id: str) -> str:
+        """Archive/delete a Notion database entry.
+        
+        Note: Notion doesn't permanently delete - it archives the page.
+        
+        Args:
+            entry_id: The entry/page ID to archive
+            
+        Returns:
+            Success or error message
+        """
+        try:
+            import requests
+            
+            if not Config.NOTION_TOKEN:
+                return "❌ NOTION_TOKEN is not configured."
+            
+            normalized_id = _normalize_notion_id(entry_id)
+            if not normalized_id:
+                return "❌ Invalid entry_id."
+            
+            response = requests.patch(
+                f"https://api.notion.com/v1/pages/{normalized_id}",
+                headers={
+                    "Authorization": f"Bearer {Config.NOTION_TOKEN}",
+                    "Notion-Version": "2022-06-28",
+                    "Content-Type": "application/json",
+                },
+                json={"archived": True},
+                timeout=30,
+            )
+            
+            if response.status_code == 200:
+                return f"✅ Entry `{normalized_id}` has been archived (deleted)"
+            else:
+                error_text = response.text[:200]
+                return f"❌ Notion API error {response.status_code}: {error_text}"
+                
+        except Exception as e:
+            logger.error(f"Error archiving Notion entry: {e}", exc_info=True)
+            return f"❌ Error: {str(e)}"
     
     # ========================================
     # CRITICAL NEW TOOLS - Nov 2025 Features

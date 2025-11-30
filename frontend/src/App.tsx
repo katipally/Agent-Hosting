@@ -29,6 +29,43 @@ function App() {
 
   const { user, loading, fetchMe } = useAuthStore()
 
+  // Track which tabs have been mounted (once mounted, stay mounted)
+  const [mountedTabs, setMountedTabs] = useState<Set<Tab>>(() => new Set([activeTab]))
+
+  // Mount tab when it becomes active
+  useEffect(() => {
+    setMountedTabs((prev) => {
+      if (prev.has(activeTab)) return prev
+      return new Set([...prev, activeTab])
+    })
+  }, [activeTab])
+
+  // Progressively load other tabs in the background after initial render
+  useEffect(() => {
+    const allTabs: Tab[] = ['chat', 'pipelines', 'projects', 'workflows', 'calendar', 'profile']
+    let cancelled = false
+    let timeoutId: ReturnType<typeof setTimeout>
+
+    const loadNextTab = (index: number) => {
+      if (cancelled || index >= allTabs.length) return
+      const tab = allTabs[index]
+      setMountedTabs((prev) => {
+        if (prev.has(tab)) return prev
+        return new Set([...prev, tab])
+      })
+      // Stagger loading by 500ms to avoid blocking the UI
+      timeoutId = setTimeout(() => loadNextTab(index + 1), 500)
+    }
+
+    // Start progressive loading after a short delay to let the active tab settle
+    timeoutId = setTimeout(() => loadNextTab(0), 1000)
+
+    return () => {
+      cancelled = true
+      clearTimeout(timeoutId)
+    }
+  }, [])
+
   useEffect(() => {
     fetchMe()
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -130,24 +167,36 @@ function App() {
       </header>
 
       <main className="flex-1 overflow-hidden">
-        <div className={activeTab === 'chat' ? 'h-full block' : 'h-full hidden'}>
-          <ChatInterface />
-        </div>
-        <div className={activeTab === 'pipelines' ? 'h-full block' : 'h-full hidden'}>
-          <PipelinesInterface />
-        </div>
-        <div className={activeTab === 'projects' ? 'h-full block' : 'h-full hidden'}>
-          <ProjectsInterface />
-        </div>
-        <div className={activeTab === 'workflows' ? 'h-full block' : 'h-full hidden'}>
-          <WorkflowsInterface />
-        </div>
-        <div className={activeTab === 'calendar' ? 'h-full block' : 'h-full hidden'}>
-          <CalendarInterface />
-        </div>
-        <div className={activeTab === 'profile' ? 'h-full block' : 'h-full hidden'}>
-          <ProfileInterface />
-        </div>
+        {mountedTabs.has('chat') && (
+          <div className={activeTab === 'chat' ? 'h-full' : 'hidden'}>
+            <ChatInterface />
+          </div>
+        )}
+        {mountedTabs.has('pipelines') && (
+          <div className={activeTab === 'pipelines' ? 'h-full' : 'hidden'}>
+            <PipelinesInterface />
+          </div>
+        )}
+        {mountedTabs.has('projects') && (
+          <div className={activeTab === 'projects' ? 'h-full' : 'hidden'}>
+            <ProjectsInterface />
+          </div>
+        )}
+        {mountedTabs.has('workflows') && (
+          <div className={activeTab === 'workflows' ? 'h-full' : 'hidden'}>
+            <WorkflowsInterface />
+          </div>
+        )}
+        {mountedTabs.has('calendar') && (
+          <div className={activeTab === 'calendar' ? 'h-full' : 'hidden'}>
+            <CalendarInterface />
+          </div>
+        )}
+        {mountedTabs.has('profile') && (
+          <div className={activeTab === 'profile' ? 'h-full' : 'hidden'}>
+            <ProfileInterface />
+          </div>
+        )}
       </main>
     </div>
   )
