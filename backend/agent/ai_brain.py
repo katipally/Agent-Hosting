@@ -2214,13 +2214,11 @@ class WorkforceAIBrain:
                     summary_kwargs = {
                         "model": self.model,
                         "messages": messages + [{"role": "user", "content": summary_prompt}],
+                        # Use max_tokens for all models; the installed OpenAI client
+                        # (openai==1.12.0) does not support max_completion_tokens.
+                        "max_tokens": 300,
+                        "temperature": 0.3,
                     }
-                    # gpt-5 models use max_completion_tokens, older models use max_tokens
-                    if self.model.startswith("gpt-5"):
-                        summary_kwargs["max_completion_tokens"] = 300
-                    else:
-                        summary_kwargs["max_tokens"] = 300
-                        summary_kwargs["temperature"] = 0.3
                     summary_response = await self.client.chat.completions.create(**summary_kwargs)
                     reasoning_summary = summary_response.choices[0].message.content
                     if reasoning_summary:
