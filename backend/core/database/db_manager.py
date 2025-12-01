@@ -43,6 +43,7 @@ from .models import (
     AppSession,
     UserSettings,
     AppSettings,
+    PipelineRun,
 )
 from utils.logger import get_logger
 

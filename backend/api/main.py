@@ -97,6 +97,7 @@ from database.models import (
     AppUser,
     UserOAuthToken,
     AppSession,
+    PipelineRun,
 )
 from slack.extractor import ExtractionCoordinator
 from gmail import GmailClient
@@ -2995,10 +2996,35 @@ class SlackPipelineRun(BaseModel):
     error: Optional[str] = None
 
 
-# In-memory registry of Slack pipeline runs. This is sufficient for v1 where
-# runs are manually triggered and short-lived. If needed, we can persist this
-# to the database later.
-slack_pipeline_runs: Dict[str, Dict[str, Any]] = {}
+# Helper functions for database-backed pipeline runs (works with multiple workers)
+def _update_pipeline_run(run_id: str, **updates):
+    """Update a pipeline run in the database."""
+    with db_manager.get_session() as session:
+        run = session.query(PipelineRun).filter(PipelineRun.run_id == run_id).first()
+        if run:
+            for key, value in updates.items():
+                setattr(run, key, value)
+            session.commit()
+
+
+def _get_pipeline_run(run_id: str) -> Optional[Dict[str, Any]]:
+    """Get a pipeline run from the database."""
+    with db_manager.get_session() as session:
+        run = session.query(PipelineRun).filter(PipelineRun.run_id == run_id).first()
+        if not run:
+            return None
+        return {
+            "run_id": run.run_id,
+            "pipeline_type": run.pipeline_type,
+            "status": run.status,
+            "created_at": run.created_at.isoformat() if run.created_at else None,
+            "started_at": run.started_at.isoformat() if run.started_at else None,
+            "finished_at": run.finished_at.isoformat() if run.finished_at else None,
+            "stats": run.stats or {},
+            "error": run.error,
+            "config": run.config or {},
+            "cancel_requested": run.cancel_requested,
+        }
 
 
 def _run_slack_pipeline(run_id: str, include_archived: bool = False, download_files: bool = False) -> None:
@@ -3006,7 +3032,7 @@ def _run_slack_pipeline(run_id: str, include_archived: bool = False, download_fi
 
     Uses the existing ExtractionCoordinator to perform a full workspace
     extraction (workspace, users, channels, messages, files) and updates the
-    in-memory run registry with progress and statistics.
+    database with progress and statistics.
     """
 
     logger.info(
@@ -3016,14 +3042,7 @@ def _run_slack_pipeline(run_id: str, include_archived: bool = False, download_fi
         download_files,
     )
 
-    run_info = slack_pipeline_runs.get(run_id)
-    if not run_info:
-        # Should not happen, but guard against it.
-        slack_pipeline_runs[run_id] = {"run_id": run_id}
-        run_info = slack_pipeline_runs[run_id]
-
-    run_info["status"] = "running"
-    run_info["started_at"] = datetime.utcnow().isoformat()
+    _update_pipeline_run(run_id, status="running", started_at=datetime.utcnow())
 
     coordinator = ExtractionCoordinator(db_manager=db_manager)
 
@@ -3034,12 +3053,7 @@ def _run_slack_pipeline(run_id: str, include_archived: bool = False, download_fi
         )
 
         stats = results.get("statistics", {}) or {}
-
-        # If a cancel request came in while the extraction was running,
-        # we still record stats but mark the run as cancelled instead of
-        # completed so the UI reflects the user's intent.
-        run_info["finished_at"] = datetime.utcnow().isoformat()
-        run_info["stats"] = {
+        run_stats = {
             "users": stats.get("users", 0),
             "channels": stats.get("channels", 0),
             "messages": stats.get("messages", 0),
@@ -3047,12 +3061,14 @@ def _run_slack_pipeline(run_id: str, include_archived: bool = False, download_fi
             "reactions": stats.get("reactions", 0),
         }
 
-        if run_info.get("cancel_requested"):
-            run_info["status"] = "cancelled"
+        # Check if cancel was requested
+        run_info = _get_pipeline_run(run_id)
+        if run_info and run_info.get("cancel_requested"):
+            _update_pipeline_run(run_id, status="cancelled", finished_at=datetime.utcnow(), stats=run_stats)
             logger.info("Slack pipeline run %s marked as cancelled", run_id)
         else:
-            run_info["status"] = "completed"
-            logger.info("Slack pipeline run %s completed: %s", run_id, run_info["stats"])
+            _update_pipeline_run(run_id, status="completed", finished_at=datetime.utcnow(), stats=run_stats)
+            logger.info("Slack pipeline run %s completed: %s", run_id, run_stats)
             
             # Automatically sync embeddings after successful extraction
             try:
@@ -3061,17 +3077,18 @@ def _run_slack_pipeline(run_id: str, include_archived: bool = False, download_fi
                     data_source="slack",
                     db_manager=db_manager
                 )
-                run_info["embedding_stats"] = embed_stats
+                # Update stats with embedding info
+                run_stats["embedding_stats"] = embed_stats
+                _update_pipeline_run(run_id, stats=run_stats)
                 logger.info("✓ Slack embeddings synced: %s", embed_stats)
             except Exception as embed_error:
                 logger.error(f"Embedding sync failed (non-fatal): {embed_error}")
-                run_info["embedding_error"] = str(embed_error)
+                run_stats["embedding_error"] = str(embed_error)
+                _update_pipeline_run(run_id, stats=run_stats)
 
     except Exception as e:  # pragma: no cover - defensive logging
         logger.error(f"Slack pipeline run {run_id} failed: {e}", exc_info=True)
-        run_info["status"] = "failed"
-        run_info["finished_at"] = datetime.utcnow().isoformat()
-        run_info["error"] = str(e)
+        _update_pipeline_run(run_id, status="failed", finished_at=datetime.utcnow(), error=str(e))
 
 
 @app.post("/api/pipelines/slack/run")
@@ -3091,13 +3108,17 @@ async def run_slack_pipeline(
     """
 
     run_id = uuid.uuid4().hex
-    slack_pipeline_runs[run_id] = {
-        "run_id": run_id,
-        "status": "pending",
-        "created_at": datetime.utcnow().isoformat(),
-        "include_archived": include_archived,
-        "download_files": download_files,
-    }
+    
+    # Create pipeline run in database (works with multiple workers)
+    with db_manager.get_session() as session:
+        pipeline_run = PipelineRun(
+            run_id=run_id,
+            pipeline_type="slack",
+            status="pending",
+            config={"include_archived": include_archived, "download_files": download_files},
+        )
+        session.add(pipeline_run)
+        session.commit()
 
     thread = threading.Thread(
         target=_run_slack_pipeline,
@@ -3116,7 +3137,7 @@ async def get_slack_pipeline_status(
 ):
     """Get the status of a Slack pipeline run."""
 
-    run = slack_pipeline_runs.get(run_id)
+    run = _get_pipeline_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
     return run
@@ -3134,15 +3155,17 @@ async def stop_slack_pipeline(
     user's intent.
     """
 
-    run = slack_pipeline_runs.get(run_id)
+    run = _get_pipeline_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
 
-    run["cancel_requested"] = True
-    if run.get("status") in ("pending", "running"):
-        run["status"] = "cancelling"
-    run["finished_at"] = datetime.utcnow().isoformat()
-    return run
+    _update_pipeline_run(
+        run_id,
+        cancel_requested=True,
+        status="cancelling" if run.get("status") in ("pending", "running") else run.get("status"),
+        finished_at=datetime.utcnow(),
+    )
+    return _get_pipeline_run(run_id)
 
 
 @app.get("/api/pipelines/slack/data")
@@ -3897,7 +3920,7 @@ async def get_gmail_messages_by_label(label_id: str, limit: int = 200, current_u
 # ============================================================================
 
 
-notion_pipeline_runs: Dict[str, Dict[str, Any]] = {}
+# notion_run_pages still in-memory for large page data (not critical for status)
 notion_run_pages: Dict[str, List[Dict[str, Any]]] = {}
 
 
@@ -4325,17 +4348,16 @@ def _persist_notion_pages(
 def _run_notion_pipeline(run_id: str) -> None:
     """Background worker to fetch Notion pages under NOTION_PARENT_PAGE_ID."""
 
-    run_info = notion_pipeline_runs.get(run_id) or {}
-    notion_pipeline_runs[run_id] = run_info
-    run_info.setdefault("cancel_requested", False)
-    run_info["status"] = "running"
-    run_info["started_at"] = datetime.utcnow().isoformat()
+    _update_pipeline_run(run_id, status="running", started_at=datetime.utcnow())
 
     token = Config.NOTION_TOKEN
     if not token:
-        run_info["status"] = "failed"
-        run_info["finished_at"] = datetime.utcnow().isoformat()
-        run_info["error"] = "NOTION_TOKEN is not configured. Please set it in your environment."
+        _update_pipeline_run(
+            run_id,
+            status="failed",
+            finished_at=datetime.utcnow(),
+            error="NOTION_TOKEN is not configured. Please set it in your environment.",
+        )
         logger.error("Notion pipeline run %s failed: NOTION_TOKEN is not configured", run_id)
         return
 
@@ -4363,10 +4385,14 @@ def _run_notion_pipeline(run_id: str) -> None:
         while True:
             # Cooperative cancellation check so long-running searches can be
             # stopped from the UI.
-            if notion_pipeline_runs.get(run_id, {}).get("cancel_requested"):
-                run_info["status"] = "cancelled"
-                run_info["finished_at"] = datetime.utcnow().isoformat()
-                run_info["page_count"] = len(pages)
+            run_info = _get_pipeline_run(run_id)
+            if run_info and run_info.get("cancel_requested"):
+                _update_pipeline_run(
+                    run_id,
+                    status="cancelled",
+                    finished_at=datetime.utcnow(),
+                    stats={"page_count": len(pages)},
+                )
                 notion_run_pages[run_id] = pages
                 _persist_notion_pages(workspace_id, workspace_name, pages, full_refresh=False)
                 logger.info("Notion pipeline run %s cancelled", run_id)
@@ -4392,9 +4418,12 @@ def _run_notion_pipeline(run_id: str) -> None:
                     response.status_code,
                     response.text[:200],
                 )
-                run_info["status"] = "failed"
-                run_info["finished_at"] = datetime.utcnow().isoformat()
-                run_info["error"] = f"Notion API error {response.status_code}"
+                _update_pipeline_run(
+                    run_id,
+                    status="failed",
+                    finished_at=datetime.utcnow(),
+                    error=f"Notion API error {response.status_code}",
+                )
                 return
 
             data = response.json()
@@ -4437,9 +4466,14 @@ def _run_notion_pipeline(run_id: str) -> None:
 
         notion_run_pages[run_id] = pages
         _persist_notion_pages(workspace_id, workspace_name, pages, full_refresh=True)
-        run_info["status"] = "completed"
-        run_info["finished_at"] = datetime.utcnow().isoformat()
-        run_info["page_count"] = len(pages)
+        
+        run_stats = {"page_count": len(pages)}
+        _update_pipeline_run(
+            run_id,
+            status="completed",
+            finished_at=datetime.utcnow(),
+            stats=run_stats,
+        )
 
         logger.info("Notion pipeline run %s completed with %s pages", run_id, len(pages))
         
@@ -4451,17 +4485,22 @@ def _run_notion_pipeline(run_id: str) -> None:
                 source_ids=[workspace_id],
                 db_manager=db_manager
             )
-            run_info["embedding_stats"] = embed_stats
+            run_stats["embedding_stats"] = embed_stats
+            _update_pipeline_run(run_id, stats=run_stats)
             logger.info("✓ Notion embeddings synced: %s", embed_stats)
         except Exception as embed_error:
             logger.error(f"Embedding sync failed (non-fatal): {embed_error}")
-            run_info["embedding_error"] = str(embed_error)
+            run_stats["embedding_error"] = str(embed_error)
+            _update_pipeline_run(run_id, stats=run_stats)
 
     except Exception as e:  # pragma: no cover - defensive logging
         logger.error(f"Notion pipeline run {run_id} failed: {e}", exc_info=True)
-        run_info["status"] = "failed"
-        run_info["finished_at"] = datetime.utcnow().isoformat()
-        run_info["error"] = str(e)
+        _update_pipeline_run(
+            run_id,
+            status="failed",
+            finished_at=datetime.utcnow(),
+            error=str(e),
+        )
 
 
 @app.post("/api/pipelines/notion/run")
@@ -4469,11 +4508,16 @@ async def run_notion_pipeline():
     """Trigger a Notion pipeline run to list pages under NOTION_PARENT_PAGE_ID."""
 
     run_id = uuid.uuid4().hex
-    notion_pipeline_runs[run_id] = {
-        "run_id": run_id,
-        "status": "pending",
-        "created_at": datetime.utcnow().isoformat(),
-    }
+    
+    # Create pipeline run in database (works with multiple workers)
+    with db_manager.get_session() as session:
+        pipeline_run = PipelineRun(
+            run_id=run_id,
+            pipeline_type="notion",
+            status="pending",
+        )
+        session.add(pipeline_run)
+        session.commit()
 
     thread = threading.Thread(target=_run_notion_pipeline, args=(run_id,), daemon=True)
     thread.start()
@@ -4485,7 +4529,7 @@ async def run_notion_pipeline():
 async def get_notion_pipeline_status(run_id: str):
     """Get the status of a Notion pipeline run."""
 
-    run = notion_pipeline_runs.get(run_id)
+    run = _get_pipeline_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
     return run
@@ -4495,22 +4539,24 @@ async def get_notion_pipeline_status(run_id: str):
 async def stop_notion_pipeline(run_id: str):
     """Request cancellation of a Notion pipeline run."""
 
-    run = notion_pipeline_runs.get(run_id)
+    run = _get_pipeline_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
 
-    run["cancel_requested"] = True
-    if run.get("status") in ("pending", "running"):
-        run["status"] = "cancelling"
-    run["finished_at"] = datetime.utcnow().isoformat()
-    return run
+    _update_pipeline_run(
+        run_id,
+        cancel_requested=True,
+        status="cancelling" if run.get("status") in ("pending", "running") else run.get("status"),
+        finished_at=datetime.utcnow(),
+    )
+    return _get_pipeline_run(run_id)
 
 
 @app.get("/api/pipelines/notion/pages")
 async def get_notion_pipeline_pages(run_id: str):
     """Return pages for a specific Notion pipeline run."""
 
-    run = notion_pipeline_runs.get(run_id)
+    run = _get_pipeline_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
 
