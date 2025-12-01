@@ -549,51 +549,56 @@ class WorkforceTools:
         return None
     
     # ========================================
-    # SLACK TOOLS - Call API Directly
+    # SLACK TOOLS - Read from Local Database
     # ========================================
     
     def get_all_slack_channels(self) -> str:
-        """Get list of all Slack channels - CALLS SLACK API DIRECTLY.
+        """Get list of all Slack channels from the local database.
         
         Returns:
             List of channels with names and IDs
         """
         try:
-            if not self.slack_client:
-                return "❌ Slack API not configured. Check SLACK_BOT_TOKEN in .env"
-
-            # Use cached channel list for speed
-            channels = self._get_slack_channels_cached()
-
-            if not channels:
-                return "No Slack channels found. You may need to invite the bot to channels."
-
-            results = [f"Found {len(channels)} Slack channels:\n"]
-            for ch in channels:
-                name = ch.get("name", "unknown")
-                channel_id = ch.get("id", "")
-                members = ch.get("num_members", 0)
-                is_private = ch.get("is_private", False)
-                privacy = "🔒 Private" if is_private else "🌐 Public"
-                results.append(f"  #{name} - {privacy} - {members} members (ID: {channel_id})")
-
-            self._cache_channels_to_db(channels)
-
-            return "\n".join(results)
+            from database.models import Channel
+            
+            logger.info("get_all_slack_channels called (DB)")
+            
+            with self.db.get_session() as session:
+                channels = session.query(Channel).filter(
+                    Channel.is_archived == False
+                ).order_by(Channel.name).all()
+                
+                if not channels:
+                    return (
+                        "No Slack channels found in synced data. "
+                        "Run the Slack sync pipeline first to populate channels."
+                    )
+                
+                results = [f"Found {len(channels)} Slack channels:\n"]
+                for ch in channels:
+                    name = ch.name or "unknown"
+                    channel_id = ch.channel_id or ""
+                    members = ch.num_members or 0
+                    is_private = ch.is_private or False
+                    privacy = "🔒 Private" if is_private else "🌐 Public"
+                    results.append(f"  #{name} - {privacy} - {members} members (ID: {channel_id})")
+                
+                logger.info(f"get_all_slack_channels returned {len(channels)} channels from DB")
+                return "\n".join(results)
         
         except Exception as e:
-            logger.error(f"Error calling Slack API: {e}")
-            return f"❌ Slack API Error: {str(e)}\nPlease check your SLACK_BOT_TOKEN and bot permissions."
+            logger.error(f"Error reading Slack channels from DB: {e}", exc_info=True)
+            return f"❌ Error reading Slack channels: {str(e)}"
     
     def get_channel_messages(self, channel: str, limit: int = 100) -> str:
-        """Get ALL messages from a specific Slack channel - CALLS SLACK API DIRECTLY.
+        """Get messages from a specific Slack channel from the local database.
         
         Args:
             channel: Channel name (without #) or channel ID
             limit: Maximum messages to retrieve
             
         Returns:
-            All messages from the channel
+            Messages from the channel (from synced data)
         """
         try:
             from database.models import Channel, Message, User
