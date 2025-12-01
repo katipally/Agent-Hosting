@@ -40,7 +40,8 @@ class Config:
     DATA_DIR = PROJECT_ROOT / os.getenv("DATA_DIR", "data")
     FILES_DIR = PROJECT_ROOT / os.getenv("FILES_DIR", "data/files")
     EXPORT_DIR = PROJECT_ROOT / os.getenv("EXPORT_DIR", "data/raw_exports")
-    LOGS_DIR = PROJECT_ROOT / "logs"
+    # LOGS_DIR uses backend directory for consistency (logs written here on both local and EC2)
+    LOGS_DIR = BASE_DIR.parent / "logs"
     PROJECT_REGISTRY_FILE = PROJECT_ROOT / os.getenv("PROJECT_REGISTRY_FILE", "data/project_registry.json")
     
     # Notion credentials

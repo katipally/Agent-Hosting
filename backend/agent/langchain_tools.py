@@ -461,7 +461,7 @@ class WorkforceTools:
             logger.error(f"Error caching messages: {e}")
 
     def _get_slack_channels_cached(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
-        """Get Slack channels with in-memory caching to avoid repeated API pagination."""
+        """Get Slack channels with in-memory caching. Falls back to DB if API is slow/unavailable."""
         import time
         global _slack_channel_cache
 
@@ -472,24 +472,49 @@ class WorkforceTools:
             logger.debug(f"Using cached channel list ({len(_slack_channel_cache['channels'])} channels)")
             return _slack_channel_cache["channels"]
 
+        # Try to load from database first (fast and reliable)
+        try:
+            from database.models import Channel
+            with self.db.get_session() as session:
+                db_channels = session.query(Channel).filter(Channel.is_archived == False).all()
+                if db_channels:
+                    channels = [
+                        {"id": ch.channel_id, "name": ch.name, "is_private": ch.is_private}
+                        for ch in db_channels
+                    ]
+                    by_name = {ch["name"]: ch for ch in channels}
+                    by_id = {ch["id"]: ch for ch in channels}
+                    _slack_channel_cache = {
+                        "channels": channels,
+                        "by_name": by_name,
+                        "by_id": by_id,
+                        "fetched_at": now,
+                    }
+                    logger.debug(f"Loaded {len(channels)} channels from database")
+                    return channels
+        except Exception as db_err:
+            logger.warning(f"Could not load channels from DB: {db_err}")
+
+        # Fallback: Try Slack API (with timeout protection from WebClient)
         if not self.slack_client:
             logger.warning("No Slack client available for channel fetch")
-            return []
+            return _slack_channel_cache["channels"]
 
         channels: List[Dict[str, Any]] = []
         cursor: Optional[str] = None
 
         try:
-            logger.info("Fetching Slack channels from API...")
+            logger.info("Fetching Slack channels from API (fallback)...")
             page_count = 0
-            while True:
+            max_pages = 5  # Limit pages to prevent long waits
+            while page_count < max_pages:
                 page_count += 1
                 logger.debug(f"Fetching channel page {page_count}...")
                 result = self.slack_client.conversations_list(
                     exclude_archived=False,
                     types="public_channel,private_channel",
                     cursor=cursor,
-                    limit=200,  # Fetch more per page to reduce API calls
+                    limit=200,
                 )
                 batch = result.get("channels", [])
                 channels.extend(batch)
@@ -502,7 +527,6 @@ class WorkforceTools:
 
             logger.info(f"Fetched {len(channels)} total channels from Slack API")
 
-            # Build lookup dicts
             by_name = {ch.get("name", ""): ch for ch in channels}
             by_id = {ch.get("id", ""): ch for ch in channels}
 
@@ -513,7 +537,7 @@ class WorkforceTools:
                 "fetched_at": now,
             }
         except Exception as e:
-            logger.error(f"Error fetching Slack channels: {e}", exc_info=True)
+            logger.error(f"Error fetching Slack channels from API: {e}", exc_info=True)
 
         return _slack_channel_cache["channels"]
 

@@ -75,9 +75,10 @@ class DatabaseManager:
             self.database_url,
             echo=False,  # Set to True for SQL query debugging
             pool_pre_ping=True,  # Verify connections before using
-            pool_recycle=3600,  # Recycle connections after 1 hour
-            pool_size=5,  # Base pool size
-            max_overflow=10,  # Allow up to 15 total connections
+            pool_recycle=1800,  # Recycle connections after 30 min (reduce memory)
+            pool_size=2,  # Reduced for t3.small (2GB RAM, 2 workers = 4 base connections)
+            max_overflow=3,  # Allow up to 5 per worker = 10 total connections max
+            pool_timeout=30,  # Wait max 30s for a connection
         )
         # expire_on_commit=False so objects (e.g., AppUser) remain usable after commits
         # in helper functions like get_current_user, where the session is closed

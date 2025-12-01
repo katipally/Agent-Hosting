@@ -57,7 +57,7 @@ class SentenceTransformerEmbedding:
     def encode(
         self,
         texts: List[str],
-        batch_size: int = 32,
+        batch_size: int = 16,  # Reduced from 32 for t3.small (2GB RAM)
         show_progress: bool = False,
         **kwargs
     ) -> np.ndarray:
