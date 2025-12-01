@@ -80,7 +80,7 @@ if str(agent_path) not in sys.path:
     sys.path.insert(0, str(agent_path))
 
 from config import Config
-from utils.logger import get_logger
+from utils.logger import get_logger, setup_logging
 from database.db_manager import DatabaseManager
 from database.models import (
     Workspace,
@@ -101,6 +101,12 @@ from database.models import (
 from slack.extractor import ExtractionCoordinator
 from gmail import GmailClient
 from notion_export import NotionClient
+
+"""Initialize logging and core services."""
+
+# Ensure data/logs directories exist and configure logging
+Config.create_directories()
+setup_logging()
 
 logger = get_logger(__name__)
 
