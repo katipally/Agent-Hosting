@@ -596,72 +596,83 @@ class WorkforceTools:
             All messages from the channel
         """
         try:
-            logger.info(f"get_channel_messages called: channel={channel}, limit={limit}")
-            
-            if not self.slack_client:
-                logger.warning("Slack client not configured")
-                return "❌ Slack API not configured"
-            
-            # Enforce Slack read permissions
+            from database.models import Channel, Message, User
+
+            logger.info(f"get_channel_messages called (DB): channel={channel}, limit={limit}")
+
+            # Enforce Slack read permissions (still respect safety rules)
             err = self._check_slack_read_allowed(channel)
             if err:
                 logger.warning(f"Slack read not allowed: {err}")
                 return f"❌ {err}"
-            
-            # Resolve channel name to ID using cached lookup (fast)
-            logger.info(f"Resolving channel ID for: {channel}")
-            channel_id = self._resolve_slack_channel_id(channel)
-            if not channel_id:
-                logger.warning(f"Channel not found: {channel}")
-                return f"❌ Channel '{channel}' not found. Use get_all_slack_channels to see available channels."
-            
-            logger.info(f"Resolved channel_id={channel_id}, fetching messages...")
-            
-            # Get messages from Slack API
-            result = self.slack_client.conversations_history(
-                channel=channel_id,
-                limit=limit
-            )
-            
-            logger.info(f"Got {len(result.get('messages', []))} messages from Slack API")
-            
-            messages = result.get('messages', [])
-            
-            if not messages:
-                return f"No messages found in channel {channel}"
-            
-            # Get user names (with limited retries to avoid hanging)
-            user_cache = {}
-            def get_user_name(user_id):
-                if user_id not in user_cache:
-                    try:
-                        user_info = self.slack_client.users_info(user=user_id)
-                        user_cache[user_id] = user_info['user'].get('real_name', user_id)
-                    except Exception as ue:
-                        logger.debug(f"Could not fetch user info for {user_id}: {ue}")
-                        user_cache[user_id] = user_id
-                return user_cache[user_id]
-            
-            # Format results
-            results = [f"📝 Messages from {channel} ({len(messages)} messages):\n"]
-            for msg in reversed(messages):  # Oldest first
+
+            normalized = self._normalize_slack_channel(channel)
+
+            with self.db.get_session() as session:
+                # Find channel in local synced Slack data
+                ch = (
+                    session.query(Channel)
+                    .filter(
+                        or_(
+                            Channel.name == normalized,
+                            Channel.name_normalized == normalized,
+                            Channel.channel_id == channel,
+                        )
+                    )
+                    .first()
+                )
+
+                if not ch:
+                    logger.warning("Channel '%s' not found in local Slack DB", channel)
+                    return (
+                        f"❌ Channel '{channel}' not found in synced Slack data. "
+                        f"Try running the Slack sync pipeline for that workspace."
+                    )
+
+                channel_id = ch.channel_id
+                logger.info(f"Found channel in DB: id={channel_id}, name={ch.name}")
+
+                # Fetch most recent messages from DB
+                q = (
+                    session.query(Message, User)
+                    .outerjoin(User, Message.user_id == User.user_id)
+                    .filter(Message.channel_id == channel_id)
+                    .order_by(Message.timestamp.desc())
+                    .limit(limit)
+                )
+                rows = q.all()
+
+                if not rows:
+                    return f"No messages found in channel {ch.name or channel}"
+
                 from datetime import datetime
-                timestamp = float(msg.get('ts', 0))
-                dt = datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M")
-                user = get_user_name(msg.get('user', 'unknown'))
-                text = msg.get('text', '')
-                results.append(f"[{dt}] {user}: {text}")
-            
-            # Store in database
-            logger.info("Caching messages to database...")
-            self._cache_messages_to_db(channel_id, messages)
-            
-            logger.info(f"get_channel_messages completed successfully")
+
+                results = [
+                    f"📝 Messages from {ch.name or channel} (most recent {len(rows)} messages):\n"
+                ]
+
+                # Reverse so we present oldest→newest within the limited window
+                for message, user in reversed(rows):
+                    ts = datetime.fromtimestamp(message.timestamp).strftime("%Y-%m-%d %H:%M")
+                    if user is not None:
+                        user_name = (
+                            user.display_name
+                            or user.real_name
+                            or user.username
+                            or user.user_id
+                        )
+                    else:
+                        user_name = message.user_id or "Someone"
+
+                    text = message.text or ""
+                    results.append(f"[{ts}] {user_name}: {text}")
+
+            logger.info("get_channel_messages completed successfully from DB")
             return "\n".join(results)
-        
+
         except Exception as e:
-            logger.error(f"Error calling Slack API: {e}", exc_info=True)
-            return f"❌ Error: {str(e)}"
+            logger.error("Error reading Slack messages from DB: %s", e, exc_info=True)
+            return f"❌ Error reading Slack messages: {str(e)}"
     
     def summarize_slack_channel(self, channel: str, limit: int = 100) -> str:
         """Get messages from a channel for summarization.
