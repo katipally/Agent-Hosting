@@ -112,7 +112,7 @@ class Config:
     
     # Logging
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-    LOG_FILE = os.getenv("LOG_FILE", "logs/slack_agent.log")
+    LOG_FILE = os.getenv("LOG_FILE", str(LOGS_DIR / "slack_agent.log"))
     
     # Workspace
     WORKSPACE_NAME = os.getenv("WORKSPACE_NAME", "")
