@@ -255,7 +255,8 @@ class WorkforceTools:
             token = get_effective_slack_bot_token(self.db)
             if not token:
                 raise ValueError("Slack bot token not configured")
-            self.slack_client = WebClient(token=token)
+            # Add timeout to prevent hanging on network issues
+            self.slack_client = WebClient(token=token, timeout=30)
         except Exception as e:
             self.slack_client = None
             logger.warning("Slack client not initialized: %s", e)
@@ -468,28 +469,38 @@ class WorkforceTools:
         cache_age = now - _slack_channel_cache["fetched_at"]
 
         if not force_refresh and _slack_channel_cache["channels"] and cache_age < _SLACK_CACHE_TTL_SECONDS:
+            logger.debug(f"Using cached channel list ({len(_slack_channel_cache['channels'])} channels)")
             return _slack_channel_cache["channels"]
 
         if not self.slack_client:
+            logger.warning("No Slack client available for channel fetch")
             return []
 
         channels: List[Dict[str, Any]] = []
         cursor: Optional[str] = None
 
         try:
+            logger.info("Fetching Slack channels from API...")
+            page_count = 0
             while True:
+                page_count += 1
+                logger.debug(f"Fetching channel page {page_count}...")
                 result = self.slack_client.conversations_list(
                     exclude_archived=False,
                     types="public_channel,private_channel",
                     cursor=cursor,
+                    limit=200,  # Fetch more per page to reduce API calls
                 )
                 batch = result.get("channels", [])
                 channels.extend(batch)
+                logger.debug(f"Got {len(batch)} channels in page {page_count}")
 
                 response_metadata = result.get("response_metadata") or {}
                 cursor = response_metadata.get("next_cursor") or ""
                 if not cursor:
                     break
+
+            logger.info(f"Fetched {len(channels)} total channels from Slack API")
 
             # Build lookup dicts
             by_name = {ch.get("name", ""): ch for ch in channels}
@@ -502,32 +513,39 @@ class WorkforceTools:
                 "fetched_at": now,
             }
         except Exception as e:
-            logger.error(f"Error fetching Slack channels: {e}")
+            logger.error(f"Error fetching Slack channels: {e}", exc_info=True)
 
         return _slack_channel_cache["channels"]
 
     def _resolve_slack_channel_id(self, channel: str) -> Optional[str]:
         """Resolve a channel name or ID to a Slack channel ID using cached data."""
+        logger.debug(f"Resolving channel: {channel}")
         normalized = self._normalize_slack_channel(channel)
 
         # If it already looks like a channel ID, return it
         if channel.startswith("C") or channel.startswith("G"):
+            logger.debug(f"Channel {channel} looks like an ID, using directly")
             return channel
 
         # Try cache first
+        logger.debug(f"Looking up normalized name: {normalized}")
         self._get_slack_channels_cached()
         global _slack_channel_cache
 
         ch = _slack_channel_cache["by_name"].get(normalized)
         if ch:
+            logger.debug(f"Found channel in cache: {ch.get('id')}")
             return ch.get("id")
 
         # If not found in cache, force refresh once and try again
+        logger.info(f"Channel '{normalized}' not in cache, force refreshing...")
         self._get_slack_channels_cached(force_refresh=True)
         ch = _slack_channel_cache["by_name"].get(normalized)
         if ch:
+            logger.debug(f"Found channel after refresh: {ch.get('id')}")
             return ch.get("id")
 
+        logger.warning(f"Channel '{channel}' (normalized: '{normalized}') not found in Slack")
         return None
     
     # ========================================
@@ -578,17 +596,26 @@ class WorkforceTools:
             All messages from the channel
         """
         try:
+            logger.info(f"get_channel_messages called: channel={channel}, limit={limit}")
+            
             if not self.slack_client:
+                logger.warning("Slack client not configured")
                 return "❌ Slack API not configured"
+            
             # Enforce Slack read permissions
             err = self._check_slack_read_allowed(channel)
             if err:
+                logger.warning(f"Slack read not allowed: {err}")
                 return f"❌ {err}"
             
             # Resolve channel name to ID using cached lookup (fast)
+            logger.info(f"Resolving channel ID for: {channel}")
             channel_id = self._resolve_slack_channel_id(channel)
             if not channel_id:
+                logger.warning(f"Channel not found: {channel}")
                 return f"❌ Channel '{channel}' not found. Use get_all_slack_channels to see available channels."
+            
+            logger.info(f"Resolved channel_id={channel_id}, fetching messages...")
             
             # Get messages from Slack API
             result = self.slack_client.conversations_history(
@@ -596,19 +623,22 @@ class WorkforceTools:
                 limit=limit
             )
             
+            logger.info(f"Got {len(result.get('messages', []))} messages from Slack API")
+            
             messages = result.get('messages', [])
             
             if not messages:
                 return f"No messages found in channel {channel}"
             
-            # Get user names
+            # Get user names (with limited retries to avoid hanging)
             user_cache = {}
             def get_user_name(user_id):
                 if user_id not in user_cache:
                     try:
                         user_info = self.slack_client.users_info(user=user_id)
                         user_cache[user_id] = user_info['user'].get('real_name', user_id)
-                    except:
+                    except Exception as ue:
+                        logger.debug(f"Could not fetch user info for {user_id}: {ue}")
                         user_cache[user_id] = user_id
                 return user_cache[user_id]
             
@@ -623,12 +653,14 @@ class WorkforceTools:
                 results.append(f"[{dt}] {user}: {text}")
             
             # Store in database
+            logger.info("Caching messages to database...")
             self._cache_messages_to_db(channel_id, messages)
             
+            logger.info(f"get_channel_messages completed successfully")
             return "\n".join(results)
         
         except Exception as e:
-            logger.error(f"Error calling Slack API: {e}")
+            logger.error(f"Error calling Slack API: {e}", exc_info=True)
             return f"❌ Error: {str(e)}"
     
     def summarize_slack_channel(self, channel: str, limit: int = 100) -> str:
