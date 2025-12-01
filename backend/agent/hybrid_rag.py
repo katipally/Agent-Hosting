@@ -15,7 +15,7 @@ except ImportError:
     START = "__start__"
     END = "__end__"
 from langchain_openai import ChatOpenAI
-from langchain.schema import HumanMessage, SystemMessage, AIMessage
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 import numpy as np
 import os
 import sys
@@ -62,16 +62,21 @@ class HybridRAGEngine:
         self,
         openai_api_key: str,
         embedding_model: Optional[SentenceTransformerEmbedding] = None,
-        reranker_model: Optional[SentenceTransformerReranker] = None
+        reranker_model: Optional[SentenceTransformerReranker] = None,
+        user_id: Optional[str] = None
     ):
         """Initialize hybrid RAG engine.
         
         Args:
             openai_api_key: OpenAI API key
-            qwen_embedding: Optional pre-loaded Qwen embedding model
-            qwen_reranker: Optional pre-loaded Qwen reranker model
+            embedding_model: Optional pre-loaded embedding model
+            reranker_model: Optional pre-loaded reranker model
+            user_id: Optional user ID for Gmail OAuth credential lookup
         """
         logger.info("Initializing Hybrid RAG Engine...")
+        
+        # Store user_id for credential lookups
+        self.user_id = user_id
         
         # Initialize embedding / reranker models (lazy loading if not provided)
         self.embedding_model = embedding_model
@@ -90,8 +95,8 @@ class HybridRAGEngine:
             streaming=True
         )
         
-        # Initialize tools
-        self.tools = WorkforceTools()
+        # Initialize tools with user_id for Gmail OAuth support
+        self.tools = WorkforceTools(user_id=user_id)
         self.langchain_tools = self.tools.get_langchain_tools()
         
         # Initialize database

@@ -269,7 +269,8 @@ class WorkforceAIBrain:
         openai_api_key: str,
         rag_engine: HybridRAGEngine,
         model: str = "gpt-5-nano",
-        temperature: float = 0.7
+        temperature: float = 0.7,
+        user_id: Optional[str] = None
     ):
         """Initialize the AI brain.
         
@@ -279,12 +280,14 @@ class WorkforceAIBrain:
             model: OpenAI model to use (default: gpt-5-nano - fast, cost-efficient reasoning, Nov 2025)
                    Examples: gpt-5-nano (default), gpt-5-mini, gpt-5 (if available)
             temperature: Model temperature (0.7 for balanced creativity)
+            user_id: User ID for loading OAuth credentials (Gmail, etc.)
         """
         self.client = AsyncOpenAI(api_key=openai_api_key)
         self.model = model
         self.temperature = temperature
         self.rag_engine = rag_engine
-        self.tools_handler = WorkforceTools()
+        self.user_id = user_id
+        self.tools_handler = WorkforceTools(user_id=user_id)
         
         # Get available tools
         self.tools = self._define_tools()
@@ -1779,6 +1782,44 @@ class WorkforceAIBrain:
                     days_back=arguments.get("days_back", 7)
                 )
             
+            # GOOGLE CALENDAR TOOLS
+            elif tool_name == "list_calendar_events":
+                result = self.tools_handler.list_calendar_events(
+                    days=arguments.get("days", 7),
+                    max_results=arguments.get("max_results", 20)
+                )
+            
+            elif tool_name == "create_calendar_event":
+                result = self.tools_handler.create_calendar_event(
+                    summary=arguments.get("summary", ""),
+                    start_time=arguments.get("start_time", ""),
+                    end_time=arguments.get("end_time", ""),
+                    description=arguments.get("description"),
+                    location=arguments.get("location"),
+                    attendees=arguments.get("attendees")
+                )
+            
+            elif tool_name == "update_calendar_event":
+                result = self.tools_handler.update_calendar_event(
+                    event_id=arguments.get("event_id", ""),
+                    summary=arguments.get("summary"),
+                    start_time=arguments.get("start_time"),
+                    end_time=arguments.get("end_time"),
+                    description=arguments.get("description"),
+                    location=arguments.get("location")
+                )
+            
+            elif tool_name == "delete_calendar_event":
+                result = self.tools_handler.delete_calendar_event(
+                    event_id=arguments.get("event_id", "")
+                )
+            
+            elif tool_name == "check_calendar_availability":
+                result = self.tools_handler.check_calendar_availability(
+                    start_time=arguments.get("start_time", ""),
+                    end_time=arguments.get("end_time", "")
+                )
+            
             else:
                 result = f"Unknown tool: {tool_name}"
             
@@ -1870,6 +1911,14 @@ class WorkforceAIBrain:
                 "get_team_activity_summary",
             }
 
+            calendar_tools = {
+                "list_calendar_events",
+                "create_calendar_event",
+                "update_calendar_event",
+                "delete_calendar_event",
+                "check_calendar_availability",
+            }
+
             allow_slack = bool(source_prefs.get("slack", True)) if source_prefs else True
             allow_gmail = bool(source_prefs.get("gmail", True)) if source_prefs else True
             allow_notion = bool(source_prefs.get("notion", True)) if source_prefs else True
@@ -1878,8 +1927,9 @@ class WorkforceAIBrain:
             wants_gmail = allow_gmail and any(k in q for k in ["gmail", "email", "inbox", "subject:", "from:", "to:"])
             wants_notion = allow_notion and any(k in q for k in ["notion", "notion page", "database", "doc", "docs"])
             wants_project = any(k in q for k in ["project", "status", "milestone", "report"])
+            wants_calendar = any(k in q for k in ["calendar", "schedule", "meeting", "event", "appointment", "available", "availability", "free time", "busy"])
 
-            if not any([wants_slack, wants_gmail, wants_notion, wants_project]):
+            if not any([wants_slack, wants_gmail, wants_notion, wants_project, wants_calendar]):
                 if source_prefs:
                     allowed_platform_tools: set[str] = set()
                     if allow_slack:
@@ -1889,6 +1939,7 @@ class WorkforceAIBrain:
                     if allow_notion:
                         allowed_platform_tools.update(notion_tools)
                     allowed_platform_tools.update(project_workspace_tools)
+                    allowed_platform_tools.update(calendar_tools)  # Always allow calendar tools
 
                     filtered_all: List[Dict[str, Any]] = []
                     for tool in self.tools:
@@ -1909,6 +1960,8 @@ class WorkforceAIBrain:
                 allowed.update(notion_tools)
             if wants_project:
                 allowed.update(project_workspace_tools)
+            if wants_calendar:
+                allowed.update(calendar_tools)
 
             # Always allow workspace-wide search tools as a fallback
             allowed.update({"search_workspace", "search_all_platforms"})

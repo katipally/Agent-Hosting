@@ -4,7 +4,8 @@ Implements action tools for Slack, Gmail, and Notion operations.
 """
 
 from typing import List, Dict, Any, Optional
-from langchain.tools import Tool, StructuredTool
+from datetime import datetime, timedelta
+from langchain_core.tools import Tool, StructuredTool
 from pydantic import BaseModel, Field
 import sys
 import os
@@ -16,6 +17,11 @@ from email.mime.base import MIMEBase
 from email import encoders
 from pathlib import Path
 from sqlalchemy import or_
+
+# Google OAuth imports for building credentials from stored tokens
+from google.oauth2.credentials import Credentials
+from google.auth.transport import requests as google_requests
+from google.auth.exceptions import RefreshError
 
 # Add core directory to path
 core_path = Path(__file__).parent.parent / 'core'
@@ -177,6 +183,47 @@ class UpdateProjectNotionInput(BaseModel):
     days_back: int = Field(default=7, description="Days of history to include")
 
 
+# ============================================================================
+# Google Calendar Input Models
+# ============================================================================
+
+class ListCalendarEventsInput(BaseModel):
+    """Input for listing calendar events."""
+    days: int = Field(default=7, description="Number of days to look ahead (default: 7)")
+    max_results: int = Field(default=20, description="Maximum number of events to return")
+
+
+class CreateCalendarEventInput(BaseModel):
+    """Input for creating a calendar event."""
+    summary: str = Field(description="Event title/summary")
+    start_time: str = Field(description="Start time in ISO format (e.g., 2025-01-15T10:00:00) or natural language (e.g., 'tomorrow at 2pm')")
+    end_time: str = Field(description="End time in ISO format or natural language")
+    description: Optional[str] = Field(default=None, description="Event description")
+    location: Optional[str] = Field(default=None, description="Event location")
+    attendees: Optional[str] = Field(default=None, description="Comma-separated list of attendee emails")
+
+
+class UpdateCalendarEventInput(BaseModel):
+    """Input for updating a calendar event."""
+    event_id: str = Field(description="Google Calendar event ID")
+    summary: Optional[str] = Field(default=None, description="New event title")
+    start_time: Optional[str] = Field(default=None, description="New start time in ISO format")
+    end_time: Optional[str] = Field(default=None, description="New end time in ISO format")
+    description: Optional[str] = Field(default=None, description="New description")
+    location: Optional[str] = Field(default=None, description="New location")
+
+
+class DeleteCalendarEventInput(BaseModel):
+    """Input for deleting a calendar event."""
+    event_id: str = Field(description="Google Calendar event ID to delete")
+
+
+class CheckCalendarAvailabilityInput(BaseModel):
+    """Input for checking calendar availability."""
+    start_time: str = Field(description="Start of time range to check (ISO format)")
+    end_time: str = Field(description="End of time range to check (ISO format)")
+
+
 # In-memory cache for Slack channels to avoid repeated API pagination
 _slack_channel_cache: Dict[str, Any] = {
     "channels": [],
@@ -190,10 +237,17 @@ _SLACK_CACHE_TTL_SECONDS = 300  # 5 minutes
 class WorkforceTools:
     """Collection of tools for the AI agent - Comprehensive API access."""
     
-    def __init__(self):
-        """Initialize tools with API clients."""
+    def __init__(self, user_id: Optional[str] = None):
+        """Initialize tools with API clients.
+        
+        Args:
+            user_id: Optional user ID to load OAuth credentials for Gmail access.
+                     If provided, Gmail client will be initialized with user's stored OAuth token.
+        """
         self.db = DatabaseManager()
         self.slack_sender = MessageSender()
+        self.user_id = user_id
+        self._gmail_initialized = False
         
         # Initialize API clients
         try:
@@ -206,12 +260,10 @@ class WorkforceTools:
             self.slack_client = None
             logger.warning("Slack client not initialized: %s", e)
         
-        try:
-            from gmail.client import GmailClient
-            self.gmail_client = GmailClient()
-        except:
-            self.gmail_client = None
-            logger.warning("Gmail client not initialized")
+        # Gmail client will be lazily initialized with user credentials
+        self.gmail_client = None
+        if user_id:
+            self._init_gmail_with_user_credentials(user_id)
         
         try:
             from notion_export.client import NotionClient
@@ -228,7 +280,85 @@ class WorkforceTools:
             self.project_tracker = None
             logger.warning(f"Project Tracker not initialized: {e}")
         
-        logger.info("Workforce tools initialized with all API clients")
+        logger.info("Workforce tools initialized (user_id=%s, gmail=%s)", 
+                    user_id[:8] + '...' if user_id else None, 
+                    self._gmail_initialized)
+    
+    def _init_gmail_with_user_credentials(self, user_id: str) -> bool:
+        """Initialize Gmail client with user's stored OAuth credentials.
+        
+        Args:
+            user_id: User ID to fetch OAuth token for
+            
+        Returns:
+            True if Gmail client was successfully initialized
+        """
+        from gmail.client import GmailClient
+        from database.models import UserOAuthToken
+        
+        try:
+            with self.db.get_session() as session:
+                token = (
+                    session.query(UserOAuthToken)
+                    .filter_by(user_id=user_id, provider="google", revoked=False)
+                    .first()
+                )
+                if not token or not token.access_token:
+                    logger.warning("No valid Google OAuth token found for user %s", user_id)
+                    return False
+                
+                scopes = token.scope.split() if token.scope else GmailClient.SCOPES
+                
+                creds = Credentials(
+                    token=token.access_token,
+                    refresh_token=token.refresh_token,
+                    token_uri="https://oauth2.googleapis.com/token",
+                    client_id=Config.GOOGLE_CLIENT_ID or None,
+                    client_secret=Config.GOOGLE_CLIENT_SECRET or None,
+                    scopes=scopes,
+                )
+                
+                # Refresh token if expired
+                if token.expires_at and token.expires_at <= datetime.utcnow():
+                    if token.refresh_token and Config.GOOGLE_CLIENT_ID and Config.GOOGLE_CLIENT_SECRET:
+                        try:
+                            creds.refresh(google_requests.Request())
+                            token.access_token = creds.token
+                            expiry = getattr(creds, "expiry", None)
+                            token.expires_at = expiry or datetime.utcnow() + timedelta(seconds=3600)
+                            session.commit()
+                            logger.info("Refreshed Google OAuth token for user %s", user_id)
+                        except RefreshError as e:
+                            logger.error("Failed to refresh Google token for user %s: %s", user_id, e)
+                            token.revoked = True
+                            session.commit()
+                            return False
+                    else:
+                        logger.warning("Token expired and cannot refresh for user %s", user_id)
+                        return False
+                
+                # Initialize Gmail client with credentials
+                self.gmail_client = GmailClient()
+                if self.gmail_client.init_with_credentials(creds):
+                    self._gmail_initialized = True
+                    logger.info("Gmail client initialized for user %s", user_id)
+                    return True
+                else:
+                    logger.error("Failed to initialize Gmail client with credentials")
+                    self.gmail_client = None
+                    return False
+                    
+        except Exception as e:
+            logger.error("Error initializing Gmail for user %s: %s", user_id, e)
+            return False
+    
+    def _ensure_gmail_authenticated(self) -> bool:
+        """Check if Gmail client is properly authenticated.
+        
+        Returns:
+            True if Gmail is ready to use, False otherwise
+        """
+        return self._gmail_initialized and self.gmail_client is not None and self.gmail_client.service is not None
     
     # ========================================
     # HELPER METHODS - Safety, Permissions & Caching
@@ -621,11 +751,8 @@ class WorkforceTools:
             Emails from the specified sender
         """
         try:
-            if not self.gmail_client:
-                return "❌ Gmail API not configured. Check your Gmail credentials."
-            
-            if not self.gmail_client.authenticate():
-                return "❌ Gmail authentication failed. Run authentication setup first."
+            if not self._ensure_gmail_authenticated():
+                return "❌ Gmail not authenticated. Please ensure you're logged in with Google OAuth."
 
             # Enforce Gmail read domain restrictions (if configured)
             if not self._is_sender_allowed_for_read(sender):
@@ -700,7 +827,7 @@ class WorkforceTools:
             Matching emails with full content
         """
         try:
-            if not self.gmail_client or not self.gmail_client.authenticate():
+            if not self._ensure_gmail_authenticated():
                 return "❌ Gmail not authenticated"
             
             # Call Gmail API
@@ -833,10 +960,8 @@ class WorkforceTools:
             Success/error message
         """
         try:
-            # Initialize Gmail client
-            gmail_client = GmailClient()
-            if not gmail_client.authenticate():
-                return "✗ Gmail authentication failed"
+            if not self._ensure_gmail_authenticated():
+                return "✗ Gmail authentication failed. Please ensure you're logged in with Google OAuth."
 
             # Enforce allowed send domains (if configured)
             if not self._is_domain_allowed_for_send(to):
@@ -862,7 +987,7 @@ class WorkforceTools:
                 )
 
             # confirm and auto_limited both send, but we still rely on AI guardrails
-            result = gmail_client.send_message({'raw': raw_message})
+            result = self.gmail_client.send_message({'raw': raw_message})
             
             if result:
                 return f"✓ Email sent to {to}"
@@ -1161,7 +1286,7 @@ class WorkforceTools:
     def get_gmail_labels(self) -> str:
         """Get all Gmail labels/folders."""
         try:
-            if not self.gmail_client or not self.gmail_client.authenticate():
+            if not self._ensure_gmail_authenticated():
                 return "Gmail not authenticated"
             
             labels = self.gmail_client.service.users().labels().list(userId='me').execute()
@@ -1179,7 +1304,7 @@ class WorkforceTools:
     def mark_email_read(self, message_id: str) -> str:
         """Mark an email as read."""
         try:
-            if not self.gmail_client or not self.gmail_client.authenticate():
+            if not self._ensure_gmail_authenticated():
                 return "Gmail not authenticated"
             
             self.gmail_client.service.users().messages().modify(
@@ -1196,7 +1321,7 @@ class WorkforceTools:
     def archive_email(self, message_id: str) -> str:
         """Archive an email (remove from inbox)."""
         try:
-            if not self.gmail_client or not self.gmail_client.authenticate():
+            if not self._ensure_gmail_authenticated():
                 return "Gmail not authenticated"
             
             self.gmail_client.service.users().messages().modify(
@@ -1213,7 +1338,7 @@ class WorkforceTools:
     def add_gmail_label(self, message_id: str, label_name: str) -> str:
         """Add a label to an email."""
         try:
-            if not self.gmail_client or not self.gmail_client.authenticate():
+            if not self._ensure_gmail_authenticated():
                 return "Gmail not authenticated"
             
             # Find label ID
@@ -1241,8 +1366,13 @@ class WorkforceTools:
     def get_email_thread(self, thread_id: str) -> str:
         """Get all messages in an email thread."""
         try:
-            if not self.gmail_client or not self.gmail_client.authenticate():
+            if not self._ensure_gmail_authenticated():
                 return "Gmail not authenticated"
+            
+            # Basic validation: require a non-empty thread ID
+            thread_id = (thread_id or "").strip()
+            if not thread_id:
+                return "❌ Gmail thread ID is required"
             
             thread = self.gmail_client.service.users().threads().get(
                 userId='me',
@@ -1262,8 +1392,18 @@ class WorkforceTools:
             
             return "\n---\n".join(result)
         except Exception as e:
-            logger.error(f"Error getting thread: {e}")
-            return f"Error: {str(e)}"
+            # Normalize Gmail 400/404 errors into a friendly message
+            try:
+                from googleapiclient.errors import HttpError
+            except Exception:  # pragma: no cover - import defensive
+                HttpError = None
+
+            if HttpError is not None and isinstance(e, HttpError) and getattr(e.resp, "status", None) in [400, 404]:
+                logger.info("Gmail thread fetch failed (status %s): %s", getattr(e.resp, "status", "unknown"), e)
+                return "❌ Gmail thread not found or invalid thread ID. It may have been deleted or the ID is incorrect."
+
+            logger.error(f"Error getting thread: {e}", exc_info=True)
+            return f"❌ Error: {str(e)}"
     
     def list_gmail_attachments_for_message(self, message_id: str) -> str:
         """List attachments for a specific Gmail message - CALLS GMAIL API DIRECTLY.
@@ -1275,7 +1415,7 @@ class WorkforceTools:
             Human-readable list of attachments with attachment IDs
         """
         try:
-            if not self.gmail_client or not self.gmail_client.authenticate():
+            if not self._ensure_gmail_authenticated():
                 return "❌ Gmail not authenticated"
             
             msg = self.gmail_client.service.users().messages().get(
@@ -1343,7 +1483,7 @@ class WorkforceTools:
             Success/error message with local path
         """
         try:
-            if not self.gmail_client or not self.gmail_client.authenticate():
+            if not self._ensure_gmail_authenticated():
                 return "❌ Gmail not authenticated"
             
             data = self.gmail_client.get_attachment(message_id, attachment_id)
@@ -1392,9 +1532,8 @@ class WorkforceTools:
             Success/error message
         """
         try:
-            gmail_client = self.gmail_client or GmailClient()
-            if not gmail_client.authenticate():
-                return "✗ Gmail authentication failed"
+            if not self._ensure_gmail_authenticated():
+                return "✗ Gmail authentication failed. Please ensure you're logged in with Google OAuth."
 
             # Enforce allowed send domains (if configured)
             if not self._is_domain_allowed_for_send(to):
@@ -1449,7 +1588,7 @@ class WorkforceTools:
                     f"Attachments prepared: {', '.join(attached_files) if attached_files else 'none'}"
                 )
 
-            result = gmail_client.send_message({"raw": raw_message})
+            result = self.gmail_client.send_message({"raw": raw_message})
             
             if result:
                 return (
@@ -3026,9 +3165,14 @@ class WorkforceTools:
             Complete email with full body content
         """
         try:
-            if not self.gmail_client or not self.gmail_client.authenticate():
+            if not self._ensure_gmail_authenticated():
                 return "❌ Gmail not authenticated"
-            
+
+            # Basic validation: require a non-empty message ID
+            message_id = (message_id or "").strip()
+            if not message_id:
+                return "❌ Gmail message ID is required"
+
             # Get FULL message
             msg = self.gmail_client.service.users().messages().get(
                 userId='me',
@@ -3082,7 +3226,17 @@ COMPLETE MESSAGE BODY:
 """
             return result
         except Exception as e:
-            logger.error(f"Error getting full email: {e}")
+            # Normalize Gmail 400/404 errors into a friendly message
+            try:
+                from googleapiclient.errors import HttpError
+            except Exception:  # pragma: no cover - import defensive
+                HttpError = None
+
+            if HttpError is not None and isinstance(e, HttpError) and getattr(e.resp, "status", None) in [400, 404]:
+                logger.info("Gmail message fetch failed (status %s): %s", getattr(e.resp, "status", "unknown"), e)
+                return "❌ Gmail message not found or invalid message ID. It may have been deleted or the ID is incorrect."
+
+            logger.error(f"Error getting full email: {e}", exc_info=True)
             return f"❌ Error: {str(e)}"
     
     def get_unread_email_count(self) -> str:
@@ -3092,7 +3246,7 @@ COMPLETE MESSAGE BODY:
             Exact number of unread emails in inbox
         """
         try:
-            if not self.gmail_client or not self.gmail_client.authenticate():
+            if not self._ensure_gmail_authenticated():
                 return "❌ Gmail not authenticated"
             
             # Get unread count
@@ -3122,9 +3276,14 @@ COMPLETE MESSAGE BODY:
             Complete thread with all messages, full bodies, and metadata
         """
         try:
-            if not self.gmail_client or not self.gmail_client.authenticate():
+            if not self._ensure_gmail_authenticated():
                 return "❌ Gmail not authenticated"
-            
+
+            # Basic validation: require a non-empty thread ID
+            thread_id = (thread_id or "").strip()
+            if not thread_id:
+                return "❌ Gmail thread ID is required"
+
             # Get COMPLETE thread with ALL messages
             thread = self.gmail_client.service.users().threads().get(
                 userId='me',
@@ -3194,11 +3353,21 @@ Subject: {subject}
 """)
             
             result.append(f"\n✅ Retrieved ALL {message_count} messages in thread")
-            
+
             return "\n".join(result)
-            
+
         except Exception as e:
-            logger.error(f"Error getting thread: {e}")
+            # Normalize Gmail 400/404 errors into a friendly message
+            try:
+                from googleapiclient.errors import HttpError
+            except Exception:  # pragma: no cover - import defensive
+                HttpError = None
+
+            if HttpError is not None and isinstance(e, HttpError) and getattr(e.resp, "status", None) in [400, 404]:
+                logger.info("Gmail thread fetch failed (status %s): %s", getattr(e.resp, "status", "unknown"), e)
+                return "❌ Gmail thread not found or invalid thread ID. It may have been deleted or the ID is incorrect."
+
+            logger.error(f"Error getting thread: {e}", exc_info=True)
             return f"❌ Error: {str(e)}"
     
     def search_email_threads(self, query: str, limit: int = 10) -> str:
@@ -3215,7 +3384,7 @@ Subject: {subject}
             List of threads with summary info and thread IDs
         """
         try:
-            if not self.gmail_client or not self.gmail_client.authenticate():
+            if not self._ensure_gmail_authenticated():
                 return "❌ Gmail not authenticated"
             
             # Search threads (not messages)
@@ -3297,7 +3466,7 @@ Subject: {subject}
         try:
             from datetime import datetime, timedelta
 
-            if not self.gmail_client or not self.gmail_client.authenticate():
+            if not self._ensure_gmail_authenticated():
                 return "❌ Gmail not authenticated"
 
             # Build date filter
@@ -3373,7 +3542,7 @@ Subject: {subject}
             Formatted search results with full content
         """
         try:
-            if not self.gmail_client or not self.gmail_client.authenticate():
+            if not self._ensure_gmail_authenticated():
                 return "❌ Gmail not authenticated"
 
             # Apply default label scoping if configured and no label: is present
@@ -4184,6 +4353,319 @@ Subject: {subject}
             bar = "██████████"
         
         return f"{level}: {bar} ({message_count} messages, {user_count} users)"
+
+    # ========================================================================
+    # GOOGLE CALENDAR TOOLS
+    # ========================================================================
+
+    def _get_calendar_service(self):
+        """Get Google Calendar service using user's OAuth credentials."""
+        if not self.user_id:
+            return None
+        
+        try:
+            from googleapiclient.discovery import build
+            from database.models import UserOAuthToken
+            
+            with self.db.get_session() as session:
+                token = session.query(UserOAuthToken).filter_by(
+                    user_id=self.user_id, provider="google"
+                ).first()
+                
+                if not token or not token.access_token:
+                    return None
+                
+                creds = Credentials(
+                    token=token.access_token,
+                    refresh_token=token.refresh_token,
+                    token_uri="https://oauth2.googleapis.com/token",
+                    client_id=Config.GOOGLE_CLIENT_ID,
+                    client_secret=Config.GOOGLE_CLIENT_SECRET,
+                    scopes=token.scope.split() if token.scope else ["https://www.googleapis.com/auth/calendar"]
+                )
+                
+                # Refresh if expired
+                if creds.expired and creds.refresh_token:
+                    try:
+                        creds.refresh(google_requests.Request())
+                        token.access_token = creds.token
+                        if creds.refresh_token:
+                            token.refresh_token = creds.refresh_token
+                        session.commit()
+                    except RefreshError:
+                        logger.warning("Failed to refresh Calendar credentials")
+                        return None
+                
+                return build("calendar", "v3", credentials=creds)
+        except Exception as e:
+            logger.error(f"Error getting Calendar service: {e}")
+            return None
+
+    def list_calendar_events(self, days: int = 7, max_results: int = 20) -> str:
+        """List upcoming calendar events.
+        
+        Args:
+            days: Number of days to look ahead
+            max_results: Maximum number of events to return
+            
+        Returns:
+            Formatted string of calendar events
+        """
+        try:
+            service = self._get_calendar_service()
+            if not service:
+                return "❌ Google Calendar not authenticated. Please sign in with Google."
+            
+            now = datetime.utcnow()
+            time_min = now.isoformat() + "Z"
+            time_max = (now + timedelta(days=days)).isoformat() + "Z"
+            
+            events_result = service.events().list(
+                calendarId="primary",
+                timeMin=time_min,
+                timeMax=time_max,
+                maxResults=max_results,
+                singleEvents=True,
+                orderBy="startTime"
+            ).execute()
+            
+            events = events_result.get("items", [])
+            
+            if not events:
+                return f"📅 No upcoming events in the next {days} days."
+            
+            result = [f"📅 **Upcoming Events (next {days} days)**\n"]
+            
+            for event in events:
+                start = event.get("start", {})
+                start_time = start.get("dateTime", start.get("date", ""))
+                summary = event.get("summary", "Untitled")
+                location = event.get("location", "")
+                event_id = event.get("id", "")
+                
+                # Format the time
+                if "T" in start_time:
+                    dt = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+                    formatted_time = dt.strftime("%b %d, %Y at %I:%M %p")
+                else:
+                    formatted_time = start_time  # All-day event
+                
+                entry = f"• **{summary}** - {formatted_time}"
+                if location:
+                    entry += f" 📍 {location}"
+                entry += f"\n  ID: `{event_id}`"
+                result.append(entry)
+            
+            return "\n".join(result)
+            
+        except Exception as e:
+            logger.error(f"Error listing calendar events: {e}")
+            return f"❌ Error listing calendar events: {str(e)}"
+
+    def create_calendar_event(
+        self,
+        summary: str,
+        start_time: str,
+        end_time: str,
+        description: Optional[str] = None,
+        location: Optional[str] = None,
+        attendees: Optional[str] = None
+    ) -> str:
+        """Create a new calendar event.
+        
+        Args:
+            summary: Event title
+            start_time: Start time in ISO format
+            end_time: End time in ISO format
+            description: Event description
+            location: Event location
+            attendees: Comma-separated attendee emails
+            
+        Returns:
+            Success message with event details
+        """
+        try:
+            service = self._get_calendar_service()
+            if not service:
+                return "❌ Google Calendar not authenticated. Please sign in with Google."
+            
+            # Parse times - handle both ISO and simple formats
+            def parse_time(time_str: str) -> str:
+                time_str = time_str.strip()
+                # If already has timezone info, return as-is
+                if "Z" in time_str or "+" in time_str or "-" in time_str[-6:]:
+                    return time_str
+                # Assume local time, add Z for UTC
+                if "T" not in time_str:
+                    time_str = time_str + "T00:00:00"
+                return time_str
+            
+            event_body = {
+                "summary": summary,
+                "start": {"dateTime": parse_time(start_time), "timeZone": "UTC"},
+                "end": {"dateTime": parse_time(end_time), "timeZone": "UTC"},
+            }
+            
+            if description:
+                event_body["description"] = description
+            if location:
+                event_body["location"] = location
+            if attendees:
+                attendee_list = [{"email": e.strip()} for e in attendees.split(",") if e.strip()]
+                if attendee_list:
+                    event_body["attendees"] = attendee_list
+            
+            event = service.events().insert(calendarId="primary", body=event_body).execute()
+            
+            return f"""✅ **Calendar Event Created**
+• **Title:** {summary}
+• **Start:** {start_time}
+• **End:** {end_time}
+• **Event ID:** `{event.get('id')}`
+• **Link:** {event.get('htmlLink', 'N/A')}"""
+            
+        except Exception as e:
+            logger.error(f"Error creating calendar event: {e}")
+            return f"❌ Error creating calendar event: {str(e)}"
+
+    def update_calendar_event(
+        self,
+        event_id: str,
+        summary: Optional[str] = None,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+        description: Optional[str] = None,
+        location: Optional[str] = None
+    ) -> str:
+        """Update an existing calendar event.
+        
+        Args:
+            event_id: Google Calendar event ID
+            summary: New title (optional)
+            start_time: New start time (optional)
+            end_time: New end time (optional)
+            description: New description (optional)
+            location: New location (optional)
+            
+        Returns:
+            Success message with updated event details
+        """
+        try:
+            service = self._get_calendar_service()
+            if not service:
+                return "❌ Google Calendar not authenticated. Please sign in with Google."
+            
+            event_id = (event_id or "").strip()
+            if not event_id:
+                return "❌ Event ID is required"
+            
+            # Get existing event
+            try:
+                event = service.events().get(calendarId="primary", eventId=event_id).execute()
+            except Exception:
+                return f"❌ Event not found with ID: {event_id}"
+            
+            # Update fields
+            if summary:
+                event["summary"] = summary
+            if description is not None:
+                event["description"] = description
+            if location is not None:
+                event["location"] = location
+            if start_time:
+                event["start"] = {"dateTime": start_time, "timeZone": "UTC"}
+            if end_time:
+                event["end"] = {"dateTime": end_time, "timeZone": "UTC"}
+            
+            updated_event = service.events().update(
+                calendarId="primary", eventId=event_id, body=event
+            ).execute()
+            
+            return f"""✅ **Calendar Event Updated**
+• **Title:** {updated_event.get('summary', 'N/A')}
+• **Event ID:** `{event_id}`
+• **Link:** {updated_event.get('htmlLink', 'N/A')}"""
+            
+        except Exception as e:
+            logger.error(f"Error updating calendar event: {e}")
+            return f"❌ Error updating calendar event: {str(e)}"
+
+    def delete_calendar_event(self, event_id: str) -> str:
+        """Delete a calendar event.
+        
+        Args:
+            event_id: Google Calendar event ID to delete
+            
+        Returns:
+            Success or error message
+        """
+        try:
+            service = self._get_calendar_service()
+            if not service:
+                return "❌ Google Calendar not authenticated. Please sign in with Google."
+            
+            event_id = (event_id or "").strip()
+            if not event_id:
+                return "❌ Event ID is required"
+            
+            # Get event details before deleting
+            try:
+                event = service.events().get(calendarId="primary", eventId=event_id).execute()
+                summary = event.get("summary", "Untitled")
+            except Exception:
+                return f"❌ Event not found with ID: {event_id}"
+            
+            service.events().delete(calendarId="primary", eventId=event_id).execute()
+            
+            return f"✅ **Calendar event deleted:** {summary} (ID: `{event_id}`)"
+            
+        except Exception as e:
+            logger.error(f"Error deleting calendar event: {e}")
+            return f"❌ Error deleting calendar event: {str(e)}"
+
+    def check_calendar_availability(self, start_time: str, end_time: str) -> str:
+        """Check calendar availability for a time range.
+        
+        Args:
+            start_time: Start of time range (ISO format)
+            end_time: End of time range (ISO format)
+            
+        Returns:
+            Availability status and any conflicting events
+        """
+        try:
+            service = self._get_calendar_service()
+            if not service:
+                return "❌ Google Calendar not authenticated. Please sign in with Google."
+            
+            # Query events in the time range
+            events_result = service.events().list(
+                calendarId="primary",
+                timeMin=start_time if "Z" in start_time else start_time + "Z",
+                timeMax=end_time if "Z" in end_time else end_time + "Z",
+                singleEvents=True,
+                orderBy="startTime"
+            ).execute()
+            
+            events = events_result.get("items", [])
+            
+            if not events:
+                return f"""✅ **You're available!**
+• Time range: {start_time} to {end_time}
+• No conflicting events found."""
+            
+            result = [f"⚠️ **Conflicts found** ({len(events)} event(s)):\n"]
+            for event in events:
+                start = event.get("start", {})
+                start_dt = start.get("dateTime", start.get("date", ""))
+                summary = event.get("summary", "Untitled")
+                result.append(f"• **{summary}** at {start_dt}")
+            
+            return "\n".join(result)
+            
+        except Exception as e:
+            logger.error(f"Error checking calendar availability: {e}")
+            return f"❌ Error checking availability: {str(e)}"
     
     def get_langchain_tools(self) -> List[Tool]:
         """Get list of LangChain tools.
@@ -4221,6 +4703,37 @@ Subject: {subject}
                 description="Create a new Notion page. Use this when user asks you to create documentation, notes, or save information to Notion.",
                 func=self.create_notion_page,
                 args_schema=CreateNotionPageInput
+            ),
+            # Calendar tools
+            StructuredTool(
+                name="list_calendar_events",
+                description="List upcoming Google Calendar events. Use this when user asks about their schedule, upcoming meetings, or calendar.",
+                func=self.list_calendar_events,
+                args_schema=ListCalendarEventsInput
+            ),
+            StructuredTool(
+                name="create_calendar_event",
+                description="Create a new Google Calendar event. Use this when user asks to schedule a meeting, add an event, or create a calendar entry.",
+                func=self.create_calendar_event,
+                args_schema=CreateCalendarEventInput
+            ),
+            StructuredTool(
+                name="update_calendar_event",
+                description="Update an existing Google Calendar event. Use this when user asks to modify, reschedule, or change a calendar event.",
+                func=self.update_calendar_event,
+                args_schema=UpdateCalendarEventInput
+            ),
+            StructuredTool(
+                name="delete_calendar_event",
+                description="Delete a Google Calendar event. Use this when user asks to remove, cancel, or delete a calendar event.",
+                func=self.delete_calendar_event,
+                args_schema=DeleteCalendarEventInput
+            ),
+            StructuredTool(
+                name="check_calendar_availability",
+                description="Check if a time slot is available on Google Calendar. Use this when user asks about availability or free time.",
+                func=self.check_calendar_availability,
+                args_schema=CheckCalendarAvailabilityInput
             ),
         ]
         

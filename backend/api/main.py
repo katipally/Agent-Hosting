@@ -67,7 +67,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 # LLM message types for summary generation
-from langchain.schema import SystemMessage, HumanMessage
+from langchain_core.messages import SystemMessage, HumanMessage
 
 # Add core directory to path
 core_path = Path(__file__).parent.parent / 'core'
@@ -530,6 +530,7 @@ async def _build_ai_brain_for_user(current_user: AppUser) -> WorkforceAIBrain:
             rag_engine=rag,
             model=model,
             temperature=0.7,
+            user_id=current_user.id,
         ),
     )
 
