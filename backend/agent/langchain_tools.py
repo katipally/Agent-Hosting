@@ -6,7 +6,7 @@ Implements action tools for Slack, Gmail, and Notion operations.
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
 from langchain_core.tools import Tool, StructuredTool
-from langchain_core.pydantic_v1 import BaseModel, Field
+from pydantic.v1 import BaseModel, Field
 import sys
 import os
 import base64
