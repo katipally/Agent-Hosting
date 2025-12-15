@@ -17,6 +17,7 @@ class ChannelExtractor(BaseExtractor):
         types: str = "public_channel,private_channel,mpim,im",
         exclude_archived: bool = False,
         progress_callback=None,
+        cancel_check=None,
     ) -> int:
         """Extract all channels from workspace."""
         logger.info(f"Starting channel extraction (types: {types})")
@@ -48,6 +49,9 @@ class ChannelExtractor(BaseExtractor):
         with tqdm(total=total, desc="Saving channels") as pbar:
             for idx, channel in enumerate(channels_list, 1):
                 try:
+                    if cancel_check and cancel_check():
+                        logger.info("Channel extraction cancelled")
+                        raise KeyboardInterrupt()
                     self.db_manager.save_channel(channel, self.workspace_id)
                     count += 1
                     pbar.update(1)

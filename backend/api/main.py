@@ -36,7 +36,7 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
-from typing import List, Dict, Any, Optional, Tuple
+from typing import Optional, List, Dict, Any, Tuple
 import json
 import os
 
@@ -115,6 +115,9 @@ Config.create_directories()
 setup_logging()
 
 logger = get_logger(__name__)
+
+class PipelineCancelled(Exception):
+    """Raised when a pipeline stop is requested."""
 
 # Initialize database manager
 db_manager = DatabaseManager()
@@ -3032,6 +3035,11 @@ def _get_pipeline_run(run_id: str) -> Optional[Dict[str, Any]]:
         }
 
 
+def _is_cancel_requested(run_id: str) -> bool:
+    run = _get_pipeline_run(run_id)
+    return bool(run and run.get("cancel_requested"))
+
+
 def _run_slack_pipeline(run_id: str, include_archived: bool = False, download_files: bool = False) -> None:
     """Background worker that runs the Slack extraction pipeline.
 
@@ -3173,6 +3181,8 @@ def _run_slack_channel_pipeline(
     def progress_cb(payload: Dict[str, float]):
         # payload keys: stage, progress, total_messages, processed_messages
         stats.update(payload)
+        if _is_cancel_requested(run_id):
+            raise PipelineCancelled()
         _update_pipeline_run(run_id, stats=stats)
 
     try:
@@ -3202,6 +3212,22 @@ def _run_slack_channel_pipeline(
             channel_id,
             count,
         )
+    except PipelineCancelled:
+        logger.info("Slack channel pipeline run %s cancelled", run_id)
+        _update_pipeline_run(
+            run_id,
+            status="cancelled",
+            finished_at=datetime.utcnow(),
+            stats=stats,
+        )
+    except KeyboardInterrupt:
+        logger.info("Slack channel pipeline run %s cancelled (interrupt)", run_id)
+        _update_pipeline_run(
+            run_id,
+            status="cancelled",
+            finished_at=datetime.utcnow(),
+            stats=stats,
+        )
     except Exception as e:  # pragma: no cover - defensive logging
         logger.error(f"Slack channel pipeline run {run_id} failed: {e}", exc_info=True)
         _update_pipeline_run(
@@ -3226,16 +3252,35 @@ def _run_slack_channels_refresh(
 
     def progress_cb(payload: Dict[str, Any]):
         stats.update(payload)
+        if _is_cancel_requested(run_id):
+            raise PipelineCancelled()
         _update_pipeline_run(run_id, stats=stats)
 
     try:
         count = extractor.extract_all_channels(
             exclude_archived=not include_archived,
             progress_callback=progress_cb,
+            cancel_check=lambda: _is_cancel_requested(run_id),
         )
         stats.update({"channels": count, "progress": 1.0, "completed_at": datetime.utcnow().isoformat()})
         _update_pipeline_run(run_id, status="completed", finished_at=datetime.utcnow(), stats=stats)
         logger.info("Slack channel list refresh run %s completed, channels=%s", run_id, count)
+    except PipelineCancelled:
+        logger.info("Slack channel list refresh run %s cancelled", run_id)
+        _update_pipeline_run(
+            run_id,
+            status="cancelled",
+            finished_at=datetime.utcnow(),
+            stats=stats,
+        )
+    except KeyboardInterrupt:
+        logger.info("Slack channel list refresh run %s cancelled (interrupt)", run_id)
+        _update_pipeline_run(
+            run_id,
+            status="cancelled",
+            finished_at=datetime.utcnow(),
+            stats=stats,
+        )
     except Exception as e:  # pragma: no cover
         logger.error(f"Slack channel list refresh run {run_id} failed: {e}", exc_info=True)
         _update_pipeline_run(
@@ -3296,6 +3341,22 @@ async def get_slack_channel_pipeline_status(
     return run
 
 
+@app.post("/api/pipelines/slack/channel/stop/{run_id}")
+async def stop_slack_channel_pipeline(
+    run_id: str,
+    current_user: AppUser = Depends(get_current_user),
+):
+    """Request cancellation of a single-channel Slack pipeline run."""
+    run = _get_pipeline_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if run["pipeline_type"] != "slack_channel":
+        raise HTTPException(status_code=400, detail="Run is not a slack_channel pipeline")
+
+    _update_pipeline_run(run_id, cancel_requested=True)
+    return {"run_id": run_id, "status": "cancelling"}
+
+
 @app.post("/api/pipelines/slack/channels/refresh")
 async def refresh_slack_channel_list(
     include_archived: bool = False,
@@ -3322,6 +3383,22 @@ async def refresh_slack_channel_list(
     thread.start()
 
     return {"run_id": run_id, "status": "started"}
+
+
+@app.post("/api/pipelines/slack/channels/stop/{run_id}")
+async def stop_slack_channel_list(
+    run_id: str,
+    current_user: AppUser = Depends(get_current_user),
+):
+    """Request cancellation of Slack channel list refresh."""
+    run = _get_pipeline_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if run["pipeline_type"] != "slack_channels":
+        raise HTTPException(status_code=400, detail="Run is not a slack_channels pipeline")
+
+    _update_pipeline_run(run_id, cancel_requested=True)
+    return {"run_id": run_id, "status": "cancelling"}
 
 
 @app.get("/api/pipelines/slack/status/{run_id}")

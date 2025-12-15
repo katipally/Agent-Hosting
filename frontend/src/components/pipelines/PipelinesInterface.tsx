@@ -102,6 +102,8 @@ export default function PipelinesInterface() {
   const [slackListProgress, setSlackListProgress] = useState<number | null>(null)
   const [slackListRunId, setSlackListRunId] = useState<string | null>(null)
   const [slackListRunStatus, setSlackListRunStatus] = useState<string | null>(null)
+  const [slackChannelRunId, setSlackChannelRunId] = useState<string | null>(null)
+  const [slackChannelRunChannelId, setSlackChannelRunChannelId] = useState<string | null>(null)
   const [slackChannelRunStatus, setSlackChannelRunStatus] = useState<string | null>(null)
   const [slackChannelProgress, setSlackChannelProgress] = useState<number | null>(null)
   const [slackMessages, setSlackMessages] = useState<SlackMessage[]>([])
@@ -138,10 +140,17 @@ export default function PipelinesInterface() {
   const gmailMessagesEndRef = useRef<HTMLDivElement | null>(null)
   const slackMessagesContainerRef = useRef<HTMLDivElement | null>(null)
   const gmailMessagesContainerRef = useRef<HTMLDivElement | null>(null)
+  // Snapshots to restore on cancel
+  const prevChannelsRef = useRef<SlackChannel[]>([])
+  const prevSlackStatsRef = useRef<SlackPipelineStats | null>(null)
+  const prevChannelMessagesRef = useRef<Record<string, SlackMessage[]>>({})
 
   const handleRefreshChannelList = async () => {
     try {
       setError(null)
+      // snapshot for rollback
+      prevChannelsRef.current = channels
+      prevSlackStatsRef.current = slackStats
       setSlackListRefreshing(true)
       setSlackListProgress(0)
       setSlackListRunStatus('starting')
@@ -171,6 +180,44 @@ export default function PipelinesInterface() {
     }
   }
 
+  const handleStopSlackChannel = async () => {
+    if (!slackChannelRunId) return
+    try {
+      setSlackChannelRunStatus('cancelling')
+      await fetch(`${API_BASE_URL}/api/pipelines/slack/channel/stop/${encodeURIComponent(slackChannelRunId)}`, {
+        method: 'POST',
+        credentials: 'include',
+      })
+      // UI rollback immediately; backend will also transition to cancelled
+      const prev = slackChannelRunChannelId ? prevChannelMessagesRef.current[slackChannelRunChannelId] : undefined
+      if (prev && slackChannelRunChannelId === selectedChannelId) {
+        setSlackMessages(prev)
+      }
+      setSlackChannelProgress(null)
+    } catch (err: any) {
+      console.error('Error stopping Slack channel refresh:', err)
+      setError(err.message || 'Failed to stop channel refresh')
+    }
+  }
+
+  const handleStopChannelList = async () => {
+    if (!slackListRunId) return
+    try {
+      setSlackListRunStatus('cancelling')
+      await fetch(`${API_BASE_URL}/api/pipelines/slack/channels/stop/${encodeURIComponent(slackListRunId)}`, {
+        method: 'POST',
+        credentials: 'include',
+      })
+      // rollback immediately
+      setChannels(prevChannelsRef.current)
+      setSlackStats(prevSlackStatsRef.current)
+      setSlackListProgress(null)
+    } catch (err: any) {
+      console.error('Error stopping channel list refresh:', err)
+      setError(err.message || 'Failed to stop channel list refresh')
+    }
+  }
+
   const pollSlackListRunStatus = async (id: string) => {
     let done = false
     while (!done) {
@@ -192,8 +239,15 @@ export default function PipelinesInterface() {
           setSlackListRefreshing(false)
           setSlackIsRunning(false)
           setSlackListProgress(progressVal ?? 1)
-          await fetchSlackData()
+          if (data.status === 'completed') {
+            await fetchSlackData()
+          } else {
+            // rollback
+            setChannels(prevChannelsRef.current)
+            setSlackStats(prevSlackStatsRef.current)
+          }
           setSlackListRunId(null)
+          setSlackListRunStatus(data.status)
         } else {
           await new Promise((resolve) => setTimeout(resolve, 2000))
         }
@@ -331,10 +385,21 @@ export default function PipelinesInterface() {
           } else {
             setSlackLastRunAt(new Date().toISOString())
           }
-          await fetchSlackData()
-          if (selectedChannelId) {
-            await fetchSlackMessages(selectedChannelId)
+          if (data.status === 'completed') {
+            await fetchSlackData()
+            if (selectedChannelId) {
+              await fetchSlackMessages(selectedChannelId)
+            }
+          } else {
+            // rollback messages for that channel
+            const prev = slackChannelRunChannelId ? prevChannelMessagesRef.current[slackChannelRunChannelId] : undefined
+            if (prev && slackChannelRunChannelId === selectedChannelId) {
+              setSlackMessages(prev)
+            }
           }
+          setSlackChannelRunId(null)
+          setSlackChannelRunChannelId(null)
+          setSlackChannelProgress(null)
         } else {
           await new Promise((resolve) => setTimeout(resolve, 2000))
         }
@@ -351,6 +416,8 @@ export default function PipelinesInterface() {
     try {
       setError(null)
       setSlackIsRunning(true)
+      setSlackChannelRunChannelId(channelId)
+      prevChannelMessagesRef.current[channelId] = slackMessages
       setSlackChannelRunStatus('starting')
       setSlackChannelProgress(null)
 
@@ -371,6 +438,7 @@ export default function PipelinesInterface() {
 
       const data = await response.json()
       const newRunId = data.run_id as string
+      setSlackChannelRunId(newRunId)
       setSlackChannelRunStatus(data.status || 'started')
 
       pollSlackChannelRunStatus(newRunId)
@@ -986,17 +1054,33 @@ export default function PipelinesInterface() {
                   {slackListRunId ? ` · run ${slackListRunId.slice(0, 8)}` : ''}
                 </span>
               )}
+              {!channelListProgressDisplay && slackListRunStatus && (
+                <span className="text-[11px] text-muted-foreground">
+                  Status: {slackListRunStatus}
+                </span>
+              )}
             </div>
-            <button
-              type="button"
-              onClick={handleRefreshChannelList}
-              disabled={slackListRefreshing || slackIsRunning}
-              className="inline-flex items-center justify-center rounded-md bg-blue-600 px-2.5 py-1.5 text-xs font-medium text-white shadow-sm hover:bg-blue-700 disabled:opacity-60 disabled:cursor-not-allowed"
-            >
-              {slackListRefreshing
-                ? `Refreshing ${slackListProgress != null ? `${(slackListProgress * 100).toFixed(0)}%` : '…'}`
-                : 'Refresh channel list'}
-            </button>
+            <div className="flex items-center gap-2">
+              {slackListRefreshing && (
+                <button
+                  type="button"
+                  onClick={handleStopChannelList}
+                  className="inline-flex items-center justify-center rounded-md bg-red-600 px-2.5 py-1.5 text-xs font-medium text-white shadow-sm hover:bg-red-700 disabled:opacity-60 disabled:cursor-not-allowed"
+                >
+                  Stop
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={handleRefreshChannelList}
+                disabled={slackListRefreshing || slackIsRunning}
+                className="inline-flex items-center justify-center rounded-md bg-blue-600 px-2.5 py-1.5 text-xs font-medium text-white shadow-sm hover:bg-blue-700 disabled:opacity-60 disabled:cursor-not-allowed"
+              >
+                {slackListRefreshing
+                  ? `Refreshing ${slackListProgress != null ? `${(slackListProgress * 100).toFixed(0)}%` : '…'}`
+                  : 'Refresh channel list'}
+              </button>
+            </div>
           </div>
           <div className="flex-1 flex overflow-hidden gap-4">
             <div className="w-80 border border-border rounded-md bg-card flex flex-col">
@@ -1051,15 +1135,30 @@ export default function PipelinesInterface() {
                           </div>
                         </td>
                         <td className="px-3 py-2 text-right align-top text-xs">{ch.message_count}</td>
-                        <td className="px-3 py-2 text-right align-top">
-                          <button
-                            type="button"
-                            onClick={() => handleRunSlackChannel(ch.channel_id)}
-                            disabled={slackIsRunning}
-                            className="inline-flex items-center justify-center rounded-md bg-blue-600 px-2 py-1 text-[11px] font-medium text-white shadow-sm hover:bg-blue-700 disabled:opacity-60 disabled:cursor-not-allowed"
-                          >
-                            Refresh
-                          </button>
+                        <td className="px-3 py-2 text-right align-top space-x-1">
+                          {slackChannelRunId && slackChannelRunChannelId === ch.channel_id ? (
+                            <>
+                              <button
+                                type="button"
+                                onClick={handleStopSlackChannel}
+                                className="inline-flex items-center justify-center rounded-md bg-red-600 px-2 py-1 text-[11px] font-medium text-white shadow-sm hover:bg-red-700"
+                              >
+                                Stop
+                              </button>
+                              <span className="text-[11px] text-muted-foreground">
+                                {slackChannelProgress != null ? `${(slackChannelProgress * 100).toFixed(0)}%` : '...'}
+                              </span>
+                            </>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => handleRunSlackChannel(ch.channel_id)}
+                              disabled={slackIsRunning}
+                              className="inline-flex items-center justify-center rounded-md bg-blue-600 px-2 py-1 text-[11px] font-medium text-white shadow-sm hover:bg-blue-700 disabled:opacity-60 disabled:cursor-not-allowed"
+                            >
+                              Refresh
+                            </button>
+                          )}
                         </td>
                       </tr>
                     ))}
@@ -1082,7 +1181,24 @@ export default function PipelinesInterface() {
               {selectedChannel ? (
                 <div className="flex flex-col h-full">
                   <div className="mb-3">
-                    <h3 className="text-base font-semibold mb-1">Channel Details</h3>
+                    <div className="flex items-center justify-between gap-2 mb-1">
+                      <h3 className="text-base font-semibold">Channel Details</h3>
+                      {slackChannelRunChannelId === selectedChannel?.channel_id && (
+                        <div className="flex items-center gap-2 text-[11px]">
+                          <span className="text-muted-foreground">
+                            {slackChannelRunStatus || 'running'}
+                            {slackChannelProgress != null ? ` · ${(slackChannelProgress * 100).toFixed(0)}%` : ''}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={handleStopSlackChannel}
+                            className="inline-flex items-center justify-center rounded-md bg-red-600 px-2 py-1 text-[11px] font-medium text-white shadow-sm hover:bg-red-700"
+                          >
+                            Stop
+                          </button>
+                        </div>
+                      )}
+                    </div>
                     <p className="text-sm mb-1">
                       <span className="font-mono text-sm">
                         {selectedChannel.name || selectedChannel.channel_id}

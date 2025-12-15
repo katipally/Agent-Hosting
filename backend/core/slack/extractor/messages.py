@@ -20,6 +20,7 @@ class MessageExtractor(BaseExtractor):
         latest: Optional[float] = None,
         include_threads: bool = True,
         progress_callback: Optional[Callable[[Dict[str, float]], None]] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> int:
         """Extract message history for a channel."""
         logger.info(f"Extracting messages from channel: {channel_id}")
@@ -65,6 +66,9 @@ class MessageExtractor(BaseExtractor):
             "messages",
             **params
         ):
+            if cancel_check and cancel_check():
+                logger.info("Message extraction cancelled during pagination")
+                raise KeyboardInterrupt()
             messages_list.append(message)
             ts = float(message.get("ts", 0))
             if not latest_ts or ts > latest_ts:
@@ -88,6 +92,9 @@ class MessageExtractor(BaseExtractor):
             with tqdm(total=len(messages_list), desc=f"Saving messages") as pbar:
                 for i, message in enumerate(messages_list, 1):
                     try:
+                        if cancel_check and cancel_check():
+                            logger.info("Message extraction cancelled during save loop")
+                            raise KeyboardInterrupt()
                         self.db_manager.save_message(message, channel_id, session=session, commit=False)
                         count += 1
                         pbar.update(1)
