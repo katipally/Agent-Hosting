@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { API_BASE_URL } from '../../lib/api'
 import { SearchableSelect } from '../common/SearchableSelect'
 import {
@@ -19,6 +19,8 @@ interface ProjectSummary {
   main_goal?: string | null
   current_status_summary?: string | null
   important_notes?: string | null
+  last_project_sync_at?: string | null
+  last_summary_generated_at?: string | null
   created_at?: string | null
   updated_at?: string | null
 }
@@ -62,6 +64,8 @@ interface ChatMessage {
   id: string
   role: 'user' | 'assistant'
   content: string
+  created_at?: string | null
+  sources?: any[]
 }
 
 async function fetchJSON<T>(url: string, options: RequestInit = {}): Promise<T> {
@@ -81,6 +85,7 @@ async function fetchJSON<T>(url: string, options: RequestInit = {}): Promise<T> 
     } catch {
       // ignore
     }
+
     throw new Error(`Request failed: ${res.status}${detail}`)
   }
   return res.json() as Promise<T>
@@ -119,6 +124,19 @@ export default function ProjectsInterface() {
 
   const [syncing, setSyncing] = useState(false)
 
+  const [projectSyncRunId, setProjectSyncRunId] = useState<string | null>(null)
+  const [projectSyncStatus, setProjectSyncStatus] = useState<string | null>(null)
+  const [projectSyncStage, setProjectSyncStage] = useState<string | null>(null)
+  const [projectSyncProgress, setProjectSyncProgress] = useState<number | null>(null)
+
+  const [projectSummaryRunId, setProjectSummaryRunId] = useState<string | null>(null)
+  const [projectSummaryStatus, setProjectSummaryStatus] = useState<string | null>(null)
+  const [projectSummaryStage, setProjectSummaryStage] = useState<string | null>(null)
+  const [projectSummaryProgress, setProjectSummaryProgress] = useState<number | null>(null)
+
+  const projectSyncRunIdRef = useRef<string | null>(null)
+  const projectSummaryRunIdRef = useRef<string | null>(null)
+
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
   const [chatInput, setChatInput] = useState('')
   const [chatLoading, setChatLoading] = useState(false)
@@ -134,6 +152,66 @@ export default function ProjectsInterface() {
     window.setTimeout(() => setError(null), 6000)
   }
 
+  const pollProjectSyncRun = async (runId: string) => {
+    projectSyncRunIdRef.current = runId
+    while (projectSyncRunIdRef.current === runId) {
+      const run = await fetchJSON<any>(`${API_BASE_URL}/api/projects/sync/status/${runId}`)
+      if (projectSyncRunIdRef.current !== runId) return run
+      const stats = run.stats || {}
+      setProjectSyncStatus(run.status || null)
+      setProjectSyncStage(stats.stage || null)
+      setProjectSyncProgress(typeof stats.progress === 'number' ? stats.progress : null)
+
+      if (['completed', 'failed', 'cancelled'].includes(run.status)) {
+        return run
+      }
+      await new Promise((resolve) => setTimeout(resolve, 2000))
+    }
+    return null
+  }
+
+  const pollProjectSummaryRun = async (runId: string) => {
+    projectSummaryRunIdRef.current = runId
+    while (projectSummaryRunIdRef.current === runId) {
+      const run = await fetchJSON<any>(`${API_BASE_URL}/api/projects/auto-summary/status/${runId}`)
+      if (projectSummaryRunIdRef.current !== runId) return run
+      const stats = run.stats || {}
+      setProjectSummaryStatus(run.status || null)
+      setProjectSummaryStage(stats.stage || null)
+      setProjectSummaryProgress(typeof stats.progress === 'number' ? stats.progress : null)
+
+      if (['completed', 'failed', 'cancelled'].includes(run.status)) {
+        return run
+      }
+      await new Promise((resolve) => setTimeout(resolve, 2000))
+    }
+    return null
+  }
+
+  const handleStopProjectSync = async () => {
+    if (!projectSyncRunId) return
+    try {
+      setProjectSyncStatus('cancelling')
+      await fetchJSON(`${API_BASE_URL}/api/projects/sync/stop/${projectSyncRunId}`, {
+        method: 'POST',
+      })
+    } catch (e: any) {
+      flashError(e.message || 'Failed to stop sync')
+    }
+  }
+
+  const handleStopProjectSummary = async () => {
+    if (!projectSummaryRunId) return
+    try {
+      setProjectSummaryStatus('cancelling')
+      await fetchJSON(`${API_BASE_URL}/api/projects/auto-summary/stop/${projectSummaryRunId}`, {
+        method: 'POST',
+      })
+    } catch (e: any) {
+      flashError(e.message || 'Failed to stop summary generation')
+    }
+  }
+
   const currentSync = selectedProject ? syncState[selectedProject.id] : undefined
   const lastSlackSync = currentSync?.slack ?? null
   const lastGmailSync = currentSync?.gmail ?? null
@@ -142,7 +220,15 @@ export default function ProjectsInterface() {
   const slackSynced = lastSlackSync ? new Date(lastSlackSync).toLocaleString() : null
   const gmailSynced = lastGmailSync ? new Date(lastGmailSync).toLocaleString() : null
   const notionSynced = lastNotionSync ? new Date(lastNotionSync).toLocaleString() : null
-  const hasSyncedAtLeastOnce = Boolean(lastSlackSync || lastGmailSync || lastNotionSync)
+  const hasSyncedAtLeastOnce = Boolean(
+    lastSlackSync ||
+      lastGmailSync ||
+      lastNotionSync ||
+      selectedProject?.last_project_sync_at,
+  )
+
+  const syncProgressText = projectSyncProgress != null ? `${(projectSyncProgress * 100).toFixed(0)}%` : null
+  const summaryProgressText = projectSummaryProgress != null ? `${(projectSummaryProgress * 100).toFixed(0)}%` : null
 
   const loadProjects = async () => {
     try {
@@ -168,8 +254,7 @@ export default function ProjectsInterface() {
         `${API_BASE_URL}/api/projects/${projectId}`,
       )
       setSelectedProject(data)
-      // Reset chat state for the new project
-      setChatMessages([])
+      // Chat history is loaded separately (DB-backed per project)
     } catch (e: any) {
       setError(e.message || 'Failed to load project details')
     } finally {
@@ -177,25 +262,65 @@ export default function ProjectsInterface() {
     }
   }
 
+  const loadProjectChatHistory = async (projectId: string) => {
+    try {
+      const data = await fetchJSON<{ messages: Array<{ role: string; content: string; created_at?: string | null; sources?: any[] }> }>(
+        `${API_BASE_URL}/api/projects/${projectId}/chat/history?limit=200`,
+      )
+      const msgs: ChatMessage[] = (data.messages || []).map((m, idx) => ({
+        id: `${projectId}-${m.created_at || idx}`,
+        role: (m.role as any) || 'assistant',
+        content: m.content,
+        created_at: m.created_at ?? null,
+        sources: (m as any).sources || [],
+      }))
+      setChatMessages(msgs)
+    } catch (e) {
+      console.error('Failed to load project chat history', e)
+      setChatMessages([])
+    }
+  }
+
+  const handleClearProjectChat = async () => {
+    if (!selectedProject) return
+    try {
+      await fetchJSON(`${API_BASE_URL}/api/projects/${selectedProject.id}/chat/history`, {
+        method: 'DELETE',
+      })
+      setChatMessages([])
+    } catch (e: any) {
+      flashError(e.message || 'Failed to clear chat history')
+    }
+  }
+
+  const refreshSelectedProject = async (projectId: string) => {
+    try {
+      const data = await fetchJSON<ProjectDetail>(`${API_BASE_URL}/api/projects/${projectId}`)
+      setSelectedProject(data)
+      setProjects((prev) => prev.map((p) => (p.id === projectId ? { ...p, ...data } : p)))
+    } catch (e) {
+      console.error('Failed to refresh project detail', e)
+    }
+  }
+
   const handleSyncData = async () => {
     if (!selectedProject) return
     setSyncing(true)
     try {
-      const data = await fetchJSON<{
-        project_id: string
-        indexed_slack: number
-        indexed_gmail: number
-        indexed_notion: number
-        last_synced: {
-          slack: string | null
-          gmail: string | null
-          notion: string | null
-        }
-      }>(`${API_BASE_URL}/api/projects/${selectedProject.id}/sync`, {
-        method: 'POST',
-      })
+      setProjectSyncRunId(null)
+      setProjectSyncStatus(null)
+      setProjectSyncStage(null)
+      setProjectSyncProgress(null)
 
-      const ls = data.last_synced || ({} as any)
+      const started = await fetchJSON<{ run_id: string }>(
+        `${API_BASE_URL}/api/projects/${selectedProject.id}/sync/run`,
+        { method: 'POST' },
+      )
+      setProjectSyncRunId(started.run_id)
+
+      const finalRun = await pollProjectSyncRun(started.run_id)
+      const finalStats = finalRun?.stats || {}
+      const ls = finalStats.last_synced || ({} as any)
       setSyncState((prev) => ({
         ...prev,
         [selectedProject.id]: {
@@ -205,7 +330,10 @@ export default function ProjectsInterface() {
         },
       }))
 
-      await handleGenerateOverview()
+      if (finalRun?.status === 'completed') {
+        await refreshSelectedProject(selectedProject.id)
+        await handleGenerateOverview()
+      }
     } catch (e: any) {
       flashError(e.message || 'Failed to sync project data')
     } finally {
@@ -216,7 +344,7 @@ export default function ProjectsInterface() {
   const loadSlackChannels = async () => {
     try {
       const data = await fetchJSON<{ channels: SlackChannelOption[] }>(
-        `${API_BASE_URL}/api/pipelines/slack/data`,
+        `${API_BASE_URL}/api/pipelines/slack/channels/options`,
       )
       setSlackChannels(data.channels || [])
     } catch (e) {
@@ -269,6 +397,11 @@ export default function ProjectsInterface() {
     } else {
       setSelectedProject(null)
     }
+  }, [selectedProjectId])
+
+  useEffect(() => {
+    if (!selectedProjectId) return
+    loadProjectChatHistory(selectedProjectId)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedProjectId])
 
@@ -299,60 +432,51 @@ export default function ProjectsInterface() {
   const handleGenerateOverview = async () => {
     if (!selectedProject) return
     try {
-      const data = await fetchJSON<{
-        short_description: string | null
-        summary: string | null
-        main_goal?: string | null
-        current_status?: string | null
-        important_notes?: string | null
-        raw: string
-      }>(`${API_BASE_URL}/api/projects/${selectedProject.id}/auto-summary`, {
-        method: 'POST',
-        body: JSON.stringify({ max_tokens: 256 }),
-      })
+      setProjectSummaryRunId(null)
+      setProjectSummaryStatus(null)
+      setProjectSummaryStage(null)
+      setProjectSummaryProgress(null)
 
-      // Merge AI-generated fields into project and persist as the canonical report
-      const updated: ProjectDetail = {
-        ...selectedProject,
-        description: data.short_description ?? selectedProject.description,
-        summary: data.summary ?? selectedProject.summary,
-        main_goal: data.main_goal ?? selectedProject.main_goal,
-        current_status_summary:
-          data.current_status ?? selectedProject.current_status_summary,
-        important_notes: data.important_notes ?? selectedProject.important_notes,
-      }
-
-      const savedCore = await fetchJSON<ProjectSummary>(
-        `${API_BASE_URL}/api/projects/${selectedProject.id}`,
+      const started = await fetchJSON<{ run_id: string }>(
+        `${API_BASE_URL}/api/projects/${selectedProject.id}/auto-summary/run`,
         {
-          method: 'PUT',
-          body: JSON.stringify({
-            name: updated.name,
-            description: updated.description,
-            status: updated.status,
-            summary: updated.summary,
-            main_goal: updated.main_goal,
-            current_status_summary: updated.current_status_summary,
-            important_notes: updated.important_notes,
-          }),
+          method: 'POST',
+          body: JSON.stringify({ max_tokens: 256 }),
         },
       )
+      setProjectSummaryRunId(started.run_id)
 
-      // The update_project API does not return linked sources, so preserve the
-      // existing sources on the selected project while refreshing core fields
-      // like description/summary and timestamps from the backend.
-      const merged: ProjectDetail = {
-        ...selectedProject,
-        ...savedCore,
-        sources: selectedProject.sources,
+      const finalRun = await pollProjectSummaryRun(started.run_id)
+      if (finalRun?.status === 'completed') {
+        await refreshSelectedProject(selectedProject.id)
       }
-
-      setSelectedProject(merged)
-      setProjects((prev) => prev.map((p) => (p.id === merged.id ? merged : p)))
     } catch (e: any) {
       flashError(e.message || 'Failed to generate overview from sources')
     }
   }
+
+  useEffect(() => {
+    projectSyncRunIdRef.current = projectSyncRunId
+  }, [projectSyncRunId])
+
+  useEffect(() => {
+    projectSummaryRunIdRef.current = projectSummaryRunId
+  }, [projectSummaryRunId])
+
+  useEffect(() => {
+    projectSyncRunIdRef.current = null
+    projectSummaryRunIdRef.current = null
+    setProjectSyncRunId(null)
+    setProjectSyncStatus(null)
+    setProjectSyncStage(null)
+    setProjectSyncProgress(null)
+    setProjectSummaryRunId(null)
+    setProjectSummaryStatus(null)
+    setProjectSummaryStage(null)
+    setProjectSummaryProgress(null)
+    setSyncing(false)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedProjectId])
 
   const handleAddSource = async (
     sourceType: 'slack_channel' | 'gmail_label' | 'notion_page',
@@ -440,6 +564,7 @@ export default function ProjectsInterface() {
         id: `${Date.now()}-assistant`,
         role: 'assistant',
         content: data.response,
+        sources: data.sources || [],
       }
       setChatMessages((prev) => [...prev, assistantMessage])
     } catch (e: any) {
@@ -555,8 +680,26 @@ export default function ProjectsInterface() {
               {/* Sources card */}
               <div className="border border-border rounded-md bg-card p-3 text-xs flex flex-col gap-2 overflow-hidden">
                 <div className="flex items-center justify-between gap-2 mb-1">
-                  <h3 className="text-xs font-semibold text-foreground">Linked sources</h3>
                   <div className="flex items-center gap-2">
+                    <h3 className="text-xs font-semibold text-foreground">Linked sources</h3>
+                    {(projectSyncRunId || projectSyncStatus) && (
+                      <span className="text-[10px] text-muted-foreground">
+                        Sync: {projectSyncStatus || 'running'}
+                        {projectSyncStage ? ` · ${projectSyncStage}` : ''}
+                        {syncProgressText ? ` · ${syncProgressText}` : ''}
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {projectSyncRunId && syncing && (
+                      <button
+                        type="button"
+                        onClick={handleStopProjectSync}
+                        className="text-[11px] px-2 py-0.5 rounded-md bg-red-600 text-white hover:bg-red-700"
+                      >
+                        Stop
+                      </button>
+                    )}
                     <button
                       type="button"
                       onClick={handleSyncData}
@@ -568,6 +711,18 @@ export default function ProjectsInterface() {
                   </div>
                 </div>
                 <div className="flex flex-col items-end gap-0.5 text-[10px] text-muted-foreground mb-1">
+                  {selectedProject.last_project_sync_at && (
+                    <span>
+                      Project sync:{' '}
+                      {new Date(selectedProject.last_project_sync_at).toLocaleString()}
+                    </span>
+                  )}
+                  {selectedProject.last_summary_generated_at && (
+                    <span>
+                      Overview:{' '}
+                      {new Date(selectedProject.last_summary_generated_at).toLocaleString()}
+                    </span>
+                  )}
                   <span>
                     Slack: {selectedProject.sources.slack_channels.length}
                     {slackSynced && <> · Last synced {slackSynced}</>}
@@ -774,6 +929,37 @@ export default function ProjectsInterface() {
                   />
                 </div>
 
+                <div className="flex items-center justify-between gap-2">
+                  <div className="text-[10px] text-muted-foreground">
+                    {(projectSummaryRunId || projectSummaryStatus) && (
+                      <>
+                        Overview: {projectSummaryStatus || 'running'}
+                        {projectSummaryStage ? ` · ${projectSummaryStage}` : ''}
+                        {summaryProgressText ? ` · ${summaryProgressText}` : ''}
+                      </>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {projectSummaryRunId && projectSummaryStatus && ['pending', 'running', 'cancelling'].includes(projectSummaryStatus) && (
+                      <button
+                        type="button"
+                        onClick={handleStopProjectSummary}
+                        className="text-[11px] px-2 py-0.5 rounded-md bg-red-600 text-white hover:bg-red-700"
+                      >
+                        Stop
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={handleGenerateOverview}
+                      disabled={!hasSyncedAtLeastOnce || Boolean(projectSummaryRunId && projectSummaryStatus && ['pending', 'running', 'cancelling'].includes(projectSummaryStatus))}
+                      className="text-[11px] px-2 py-0.5 rounded-md bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-60"
+                    >
+                      Generate overview
+                    </button>
+                  </div>
+                </div>
+
                 <div className="grid grid-cols-1 gap-2 mt-1">
                   <div>
                     <label className="block text-[10px] font-semibold text-muted-foreground mb-0.5">
@@ -853,10 +1039,20 @@ export default function ProjectsInterface() {
               {/* Project chat */}
               <div className="border border-border rounded-md bg-card p-3 text-xs flex flex-col h-full min-h-[220px]">
                 <div className="flex items-center justify-between gap-2 mb-2">
-                  <h3 className="text-xs font-semibold text-foreground">Project chat</h3>
-                  <span className="text-[10px] text-muted-foreground">
-                    Ask questions using only this project's Slack, Gmail, and Notion data.
-                  </span>
+                  <div className="flex items-center gap-2">
+                    <h3 className="text-xs font-semibold text-foreground">Project chat</h3>
+                    <span className="text-[10px] text-muted-foreground">
+                      Ask questions using only this project's Slack, Gmail, and Notion data.
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleClearProjectChat}
+                    disabled={chatLoading}
+                    className="text-[11px] px-2 py-1 rounded-md border border-border bg-background text-foreground hover:bg-muted disabled:opacity-60"
+                  >
+                    Clear chat
+                  </button>
                 </div>
                 <div className="flex-1 overflow-auto border border-border rounded-md bg-background/40 p-2 mb-2">
                   {syncing ? (

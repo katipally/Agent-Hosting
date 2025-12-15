@@ -45,6 +45,7 @@ from .models import (
     UserSettings,
     AppSettings,
     PipelineRun,
+    ProjectSyncCursor,
 )
 from utils.logger import get_logger
 
@@ -106,8 +107,9 @@ class DatabaseManager:
                 needs_object_type = "object_type" not in columns
                 needs_url = "url" not in columns
                 needs_raw = "raw_data" not in columns
+                needs_embedding = "embedding" not in columns
 
-                if needs_object_type or needs_url or needs_raw:
+                if needs_object_type or needs_url or needs_raw or needs_embedding:
                     dialect = self.engine.dialect.name
                     json_type = "JSON" if dialect == "postgresql" else "TEXT"
 
@@ -123,6 +125,10 @@ class DatabaseManager:
                         if needs_raw:
                             conn.execute(
                                 text(f"ALTER TABLE notion_pages ADD COLUMN raw_data {json_type}")
+                            )
+                        if needs_embedding:
+                            conn.execute(
+                                text(f"ALTER TABLE notion_pages ADD COLUMN embedding {json_type}")
                             )
 
                 # Older schemas had a self-referential foreign key on parent_id
@@ -182,12 +188,95 @@ class DatabaseManager:
                                 )
                             )
 
+            # Best-effort indexes for project sync / embedding scans (Postgres only)
+            if self.engine.dialect.name == "postgresql":
+                with self.engine.begin() as conn:
+                    try:
+                        conn.execute(
+                            text(
+                                "CREATE INDEX IF NOT EXISTS idx_messages_channel_ts_unembedded "
+                                "ON messages (channel_id, timestamp DESC) WHERE embedding IS NULL"
+                            )
+                        )
+                    except Exception:
+                        pass
+
+                    try:
+                        conn.execute(
+                            text(
+                                "CREATE INDEX IF NOT EXISTS idx_gmail_account_date_unembedded "
+                                "ON gmail_messages (account_email, date DESC) WHERE embedding IS NULL"
+                            )
+                        )
+                    except Exception:
+                        pass
+
+                    try:
+                        conn.execute(
+                            text(
+                                "CREATE INDEX IF NOT EXISTS idx_gmail_label_ids_gin "
+                                "ON gmail_messages USING GIN ((label_ids::jsonb))"
+                            )
+                        )
+                    except Exception:
+                        pass
+
+                    try:
+                        conn.execute(
+                            text(
+                                "CREATE INDEX IF NOT EXISTS idx_notion_workspace_last_edited_unembedded "
+                                "ON notion_pages (workspace_id, last_edited_time DESC) WHERE embedding IS NULL"
+                            )
+                        )
+                    except Exception:
+                        pass
+
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error(f"Schema upgrade error: {e}", exc_info=True)
     
     def get_session(self) -> Session:
         """Get database session."""
         return self.SessionLocal()
+
+    def get_project_sync_cursor(
+        self,
+        project_id: str,
+        source_type: str,
+        source_id: str,
+    ) -> Optional[float]:
+        with self.get_session() as session:
+            row = (
+                session.query(ProjectSyncCursor)
+                .filter_by(project_id=project_id, source_type=source_type, source_id=source_id)
+                .first()
+            )
+            return row.cursor_value if row else None
+
+    def upsert_project_sync_cursor(
+        self,
+        project_id: str,
+        source_type: str,
+        source_id: str,
+        cursor_value: Optional[float],
+    ) -> None:
+        with self.get_session() as session:
+            row = (
+                session.query(ProjectSyncCursor)
+                .filter_by(project_id=project_id, source_type=source_type, source_id=source_id)
+                .first()
+            )
+            if row:
+                row.cursor_value = cursor_value
+                row.updated_at = datetime.utcnow()
+            else:
+                row = ProjectSyncCursor(
+                    project_id=project_id,
+                    source_type=source_type,
+                    source_id=source_id,
+                    cursor_value=cursor_value,
+                )
+                session.add(row)
+            session.commit()
     
     # Workspace operations
     def save_workspace(self, workspace_data: Dict[str, Any]) -> Workspace:

@@ -301,6 +301,8 @@ class NotionPage(Base):
     # Raw payload for future enrichment
     raw_data = Column(JSON)
 
+    embedding = Column(JSON)
+
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
@@ -537,6 +539,23 @@ class ProjectSource(Base):
         UniqueConstraint("project_id", "source_type", "source_id", name="uq_project_source"),
         Index("idx_project_source_project", "project_id"),
         Index("idx_project_source_type", "source_type"),
+    )
+
+
+class ProjectSyncCursor(Base):
+    __tablename__ = "project_sync_cursors"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    project_id = Column(String(50), ForeignKey("projects.id"), nullable=False)
+    source_type = Column(String(50), nullable=False)
+    source_id = Column(String(255), nullable=False)
+    cursor_value = Column(Float)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("project_id", "source_type", "source_id", name="uq_project_sync_cursor"),
+        Index("idx_project_sync_cursor_project", "project_id"),
+        Index("idx_project_sync_cursor_type", "source_type"),
     )
 
 
