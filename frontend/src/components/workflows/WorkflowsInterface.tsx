@@ -1,5 +1,14 @@
 import { useEffect, useState } from 'react'
 import { API_BASE_URL } from '../../lib/api'
+import { SearchableSelect } from '../common/SearchableSelect'
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import { Button } from '@/components/ui/button'
 
 interface WorkflowChannel {
   slack_channel_id: string
@@ -67,6 +76,10 @@ export default function WorkflowsInterface() {
 
   const [remainingSeconds, setRemainingSeconds] = useState<number | null>(null)
   const [pendingInterval, setPendingInterval] = useState<number | null>(null)
+
+  const [createWorkflowOpen, setCreateWorkflowOpen] = useState(false)
+  const [createWorkflowName, setCreateWorkflowName] = useState('')
+  const [createWorkflowMasterPageId, setCreateWorkflowMasterPageId] = useState('')
 
   const selectedWorkflow =
     workflows.find((w) => w.id === selectedWorkflowId) || (workflows.length > 0 ? workflows[0] : null)
@@ -207,10 +220,22 @@ export default function WorkflowsInterface() {
   ])
 
   const handleCreateWorkflow = async () => {
-    const name = window.prompt('Workflow name (e.g., "Slack → Notion: Zephyr")')
-    if (!name) return
-    const masterPageId = window.prompt('Notion master page ID (required for Slack → Notion)')
-    if (!masterPageId) return
+    setCreateWorkflowName('')
+    setCreateWorkflowMasterPageId('')
+    setCreateWorkflowOpen(true)
+  }
+
+  const handleConfirmCreateWorkflow = async () => {
+    const name = createWorkflowName.trim()
+    const masterPageId = createWorkflowMasterPageId.trim()
+    if (!name) {
+      setError('Workflow name is required')
+      return
+    }
+    if (!masterPageId) {
+      setError('Notion master page ID is required')
+      return
+    }
 
     try {
       setError(null)
@@ -232,6 +257,7 @@ export default function WorkflowsInterface() {
       const created = (await res.json()) as Workflow
       setWorkflows((prev) => [created, ...prev])
       setSelectedWorkflowId(created.id)
+      setCreateWorkflowOpen(false)
     } catch (e: any) {
       console.error('Error creating workflow', e)
       setError(e.message || 'Failed to create workflow')
@@ -359,12 +385,54 @@ export default function WorkflowsInterface() {
       parts.push(`${m}min${m === 1 ? '' : 's'}`)
     }
     parts.push(`${s}sec`)
+
     return parts.join(' ')
   }
 
   return (
     <div className="flex h-full bg-background">
-      {/* Sidebar: workflow list */}
+      <Dialog open={createWorkflowOpen} onOpenChange={setCreateWorkflowOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Create workflow</DialogTitle>
+          </DialogHeader>
+          <div className="grid gap-3">
+            <div className="grid gap-1">
+              <label className="text-xs font-medium text-muted-foreground" htmlFor="create-workflow-name">
+                Name
+              </label>
+              <input
+                id="create-workflow-name"
+                className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary"
+                value={createWorkflowName}
+                onChange={(e) => setCreateWorkflowName(e.target.value)}
+                placeholder='e.g. "Slack → Notion: Zephyr"'
+              />
+            </div>
+            <div className="grid gap-1">
+              <label className="text-xs font-medium text-muted-foreground" htmlFor="create-workflow-master">
+                Notion master page ID
+              </label>
+              <input
+                id="create-workflow-master"
+                className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary"
+                value={createWorkflowMasterPageId}
+                onChange={(e) => setCreateWorkflowMasterPageId(e.target.value)}
+                placeholder="Notion page ID"
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={() => setCreateWorkflowOpen(false)}>
+              Cancel
+            </Button>
+            <Button type="button" onClick={handleConfirmCreateWorkflow}>
+              Create
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       <aside className="w-64 border-r border-border bg-card flex flex-col">
         <div className="p-3 border-b border-border flex items-center justify-between">
           <h2 className="text-sm font-semibold text-foreground">Workflows</h2>
@@ -470,18 +538,18 @@ export default function WorkflowsInterface() {
                       </button>
                     </div>
                     <label className="text-[10px] text-muted-foreground">Interval</label>
-                    <select
-                      className="text-[11px] rounded-md border border-border bg-background px-1.5 py-0.5"
-                      aria-label="Workflow interval"
-                      value={pendingInterval ?? (selectedWorkflow.poll_interval_seconds || 3600)}
-                      onChange={(e) => setPendingInterval(Number(e.target.value) || 3600)}
-                    >
-                      {INTERVAL_OPTIONS.map((opt) => (
-                        <option key={opt.value} value={opt.value}>
-                          {opt.label}
-                        </option>
-                      ))}
-                    </select>
+                    <SearchableSelect
+                      value={String(pendingInterval ?? (selectedWorkflow.poll_interval_seconds || 3600))}
+                      onChange={(next) => setPendingInterval(Number(next) || 3600)}
+                      options={INTERVAL_OPTIONS.map((opt) => ({
+                        value: String(opt.value),
+                        label: opt.label,
+                      }))}
+                      searchPlaceholder="Search intervals…"
+                      containerClassName="w-[160px]"
+                      fullWidth
+                      triggerClassName="text-[11px]"
+                    />
                     {pendingInterval !== null && pendingInterval !== selectedWorkflow.poll_interval_seconds && (
                       <div className="flex items-center gap-1 mt-1">
                         <button
@@ -541,20 +609,20 @@ export default function WorkflowsInterface() {
                 <div className="flex items-center justify-between gap-2 mb-1">
                   <h3 className="text-xs font-semibold text-foreground">Slack channels</h3>
                   <div className="flex items-center gap-1">
-                    <select
-                      className="text-[11px] rounded-md border border-border bg-background px-1.5 py-0.5 max-w-[180px]"
-                      aria-label="Select Slack channel to link"
+                    <SearchableSelect
                       value={slackToAdd}
-                      onChange={(e) => setSlackToAdd(e.target.value)}
-                    >
-                      <option value="">Select channel…</option>
-                      {slackChannels.map((ch) => (
-                        <option key={ch.channel_id} value={ch.channel_id}>
-                          {ch.name || ch.channel_id}
-                          {ch.is_private ? ' (private)' : ''}
-                        </option>
-                      ))}
-                    </select>
+                      onChange={setSlackToAdd}
+                      options={slackChannels.map((ch) => ({
+                        value: ch.channel_id,
+                        label: `${ch.name || ch.channel_id}${ch.is_private ? ' (private)' : ''}`,
+                      }))}
+                      placeholder="Select channel…"
+                      searchPlaceholder="Search channels…"
+                      allowClear
+                      containerClassName="w-[180px]"
+                      fullWidth
+                      triggerClassName="text-[11px]"
+                    />
                     <button
                       type="button"
                       onClick={handleAddSlackChannel}

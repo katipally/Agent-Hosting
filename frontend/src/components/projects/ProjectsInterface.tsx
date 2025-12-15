@@ -1,5 +1,14 @@
 import { useEffect, useState } from 'react'
 import { API_BASE_URL } from '../../lib/api'
+import { SearchableSelect } from '../common/SearchableSelect'
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import { Button } from '@/components/ui/button'
 
 interface ProjectSummary {
   id: string
@@ -65,7 +74,14 @@ async function fetchJSON<T>(url: string, options: RequestInit = {}): Promise<T> 
     ...options,
   })
   if (!res.ok) {
-    throw new Error(`Request failed: ${res.status}`)
+    let detail = ''
+    try {
+      const text = await res.text()
+      detail = text ? `: ${text.slice(0, 200)}` : ''
+    } catch {
+      // ignore
+    }
+    throw new Error(`Request failed: ${res.status}${detail}`)
   }
   return res.json() as Promise<T>
 }
@@ -109,6 +125,14 @@ export default function ProjectsInterface() {
 
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+
+  const [createProjectOpen, setCreateProjectOpen] = useState(false)
+  const [createProjectName, setCreateProjectName] = useState('')
+
+  const flashError = (message: string) => {
+    setError(message)
+    window.setTimeout(() => setError(null), 6000)
+  }
 
   const currentSync = selectedProject ? syncState[selectedProject.id] : undefined
   const lastSlackSync = currentSync?.slack ?? null
@@ -183,7 +207,7 @@ export default function ProjectsInterface() {
 
       await handleGenerateOverview()
     } catch (e: any) {
-      alert(e.message || 'Failed to sync project data')
+      flashError(e.message || 'Failed to sync project data')
     } finally {
       setSyncing(false)
     }
@@ -249,8 +273,16 @@ export default function ProjectsInterface() {
   }, [selectedProjectId])
 
   const handleCreateProject = async () => {
-    const name = prompt('Project name')
-    if (!name) return
+    setCreateProjectName('')
+    setCreateProjectOpen(true)
+  }
+
+  const handleConfirmCreateProject = async () => {
+    const name = createProjectName.trim()
+    if (!name) {
+      flashError('Project name is required')
+      return
+    }
     try {
       const data = await fetchJSON<ProjectDetail>(`${API_BASE_URL}/api/projects`, {
         method: 'POST',
@@ -258,8 +290,9 @@ export default function ProjectsInterface() {
       })
       setProjects((prev) => [data, ...prev])
       setSelectedProjectId(data.id)
+      setCreateProjectOpen(false)
     } catch (e: any) {
-      alert(e.message || 'Failed to create project')
+      flashError(e.message || 'Failed to create project')
     }
   }
 
@@ -317,7 +350,7 @@ export default function ProjectsInterface() {
       setSelectedProject(merged)
       setProjects((prev) => prev.map((p) => (p.id === merged.id ? merged : p)))
     } catch (e: any) {
-      alert(e.message || 'Failed to generate overview from sources')
+      flashError(e.message || 'Failed to generate overview from sources')
     }
   }
 
@@ -348,7 +381,7 @@ export default function ProjectsInterface() {
       if (sourceType === 'gmail_label') setGmailToAdd('')
       if (sourceType === 'notion_page') setNotionToAdd('')
     } catch (e: any) {
-      alert(e.message || 'Failed to add source')
+      flashError(e.message || 'Failed to add source')
     }
   }
 
@@ -368,7 +401,7 @@ export default function ProjectsInterface() {
       )
       await loadProjectDetail(selectedProject.id)
     } catch (e: any) {
-      alert(e.message || 'Failed to remove source')
+      flashError(e.message || 'Failed to remove source')
     }
   }
 
@@ -424,6 +457,34 @@ export default function ProjectsInterface() {
 
   return (
     <div className="flex h-full bg-background">
+      <Dialog open={createProjectOpen} onOpenChange={setCreateProjectOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Create project</DialogTitle>
+          </DialogHeader>
+          <div className="grid gap-2">
+            <label className="text-xs font-medium text-muted-foreground" htmlFor="create-project-name">
+              Project name
+            </label>
+            <input
+              id="create-project-name"
+              className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary"
+              value={createProjectName}
+              onChange={(e) => setCreateProjectName(e.target.value)}
+              placeholder="e.g. Growth Q1"
+            />
+          </div>
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={() => setCreateProjectOpen(false)}>
+              Cancel
+            </Button>
+            <Button type="button" onClick={handleConfirmCreateProject}>
+              Create
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {/* Sidebar: project list */}
       <aside className="w-64 border-r border-border bg-card flex flex-col">
         <div className="p-3 border-b border-border flex items-center justify-between">
@@ -526,20 +587,20 @@ export default function ProjectsInterface() {
                   <div className="flex items-center justify-between gap-2 mb-1">
                     <span className="text-[11px] font-semibold text-foreground">Slack channels</span>
                     <div className="flex items-center gap-1">
-                      <select
-                        className="text-[11px] rounded-md border border-border bg-background px-1.5 py-0.5 max-w-[180px]"
-                        aria-label="Select Slack channel to link"
+                      <SearchableSelect
                         value={slackToAdd}
-                        onChange={(e) => setSlackToAdd(e.target.value)}
-                      >
-                        <option value="">Select channel…</option>
-                        {slackChannels.map((ch) => (
-                          <option key={ch.channel_id} value={ch.channel_id}>
-                            {ch.name || ch.channel_id}
-                            {ch.is_private ? ' (private)' : ''}
-                          </option>
-                        ))}
-                      </select>
+                        onChange={setSlackToAdd}
+                        options={slackChannels.map((ch) => ({
+                          value: ch.channel_id,
+                          label: `${ch.name || ch.channel_id}${ch.is_private ? ' (private)' : ''}`,
+                        }))}
+                        placeholder="Select channel…"
+                        searchPlaceholder="Search channels…"
+                        allowClear
+                        containerClassName="w-[180px]"
+                        fullWidth
+                        triggerClassName="text-[11px]"
+                      />
                       <button
                         type="button"
                         onClick={() => {
@@ -577,19 +638,17 @@ export default function ProjectsInterface() {
                   <div className="flex items-center justify-between gap-2 mb-1 mt-2">
                     <span className="text-[11px] font-semibold text-foreground">Gmail labels</span>
                     <div className="flex items-center gap-1">
-                      <select
-                        className="text-[11px] rounded-md border border-border bg-background px-1.5 py-0.5 max-w-[180px]"
-                        aria-label="Select Gmail label to link"
+                      <SearchableSelect
                         value={gmailToAdd}
-                        onChange={(e) => setGmailToAdd(e.target.value)}
-                      >
-                        <option value="">Select label…</option>
-                        {gmailLabels.map((lbl) => (
-                          <option key={lbl.id} value={lbl.id}>
-                            {lbl.name}
-                          </option>
-                        ))}
-                      </select>
+                        onChange={setGmailToAdd}
+                        options={gmailLabels.map((lbl) => ({ value: lbl.id, label: lbl.name }))}
+                        placeholder="Select label…"
+                        searchPlaceholder="Search labels…"
+                        allowClear
+                        containerClassName="w-[180px]"
+                        fullWidth
+                        triggerClassName="text-[11px]"
+                      />
                       <button
                         type="button"
                         onClick={() => {
@@ -627,19 +686,17 @@ export default function ProjectsInterface() {
                   <div className="flex items-center justify-between gap-2 mb-1 mt-2">
                     <span className="text-[11px] font-semibold text-foreground">Notion pages</span>
                     <div className="flex items-center gap-1">
-                      <select
-                        className="text-[11px] rounded-md border border-border bg-background px-1.5 py-0.5 max-w-[180px]"
-                        aria-label="Select Notion page to link"
+                      <SearchableSelect
                         value={notionToAdd}
-                        onChange={(e) => setNotionToAdd(e.target.value)}
-                      >
-                        <option value="">Select page…</option>
-                        {notionPages.map((p) => (
-                          <option key={p.id} value={p.id}>
-                            {p.title}
-                          </option>
-                        ))}
-                      </select>
+                        onChange={setNotionToAdd}
+                        options={notionPages.map((p) => ({ value: p.id, label: p.title }))}
+                        placeholder="Select page…"
+                        searchPlaceholder="Search pages…"
+                        allowClear
+                        containerClassName="w-[180px]"
+                        fullWidth
+                        triggerClassName="text-[11px]"
+                      />
                       <button
                         type="button"
                         onClick={() => {
@@ -699,21 +756,22 @@ export default function ProjectsInterface() {
                       }
                     />
                   </div>
-                  <select
-                    className="text-[11px] rounded-md border border-border bg-background px-1.5 py-0.5 capitalize"
-                    aria-label="Project status"
+                  <SearchableSelect
                     value={selectedProject.status || 'not_started'}
-                    onChange={(e) =>
-                      setSelectedProject((prev) =>
-                        prev ? { ...prev, status: e.target.value } : prev,
-                      )
+                    onChange={(next) =>
+                      setSelectedProject((prev) => (prev ? { ...prev, status: next } : prev))
                     }
-                  >
-                    <option value="not_started">Not started</option>
-                    <option value="in_progress">In progress</option>
-                    <option value="blocked">Blocked</option>
-                    <option value="completed">Completed</option>
-                  </select>
+                    options={[
+                      { value: 'not_started', label: 'Not started' },
+                      { value: 'in_progress', label: 'In progress' },
+                      { value: 'blocked', label: 'Blocked' },
+                      { value: 'completed', label: 'Completed' },
+                    ]}
+                    searchPlaceholder="Search status…"
+                    containerClassName="w-[160px]"
+                    fullWidth
+                    triggerClassName="text-[11px] capitalize"
+                  />
                 </div>
 
                 <div className="grid grid-cols-1 gap-2 mt-1">

@@ -12,6 +12,7 @@ from typing import Optional, List, Dict, Any
 from sqlalchemy import create_engine, func, text, inspect
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from config import Config
 from .models import (
@@ -323,14 +324,34 @@ class DatabaseManager:
             return channel
     
     # Message operations
-    def save_message(self, message_data: Dict[str, Any], channel_id: str) -> Message:
-        """Save or update message."""
-        with self.get_session() as session:
+    def save_message(
+        self,
+        message_data: Dict[str, Any],
+        channel_id: str,
+        session: Optional[Session] = None,
+        commit: bool = True,
+    ) -> Message:
+        """Save or update message.
+
+        Args:
+            message_data: Slack message JSON.
+            channel_id: Channel ID for scoping message_id.
+            session: Optional existing SQLAlchemy session for batched writes.
+            commit: When using an external session, set commit=False and commit in batches.
+        """
+
+        owns_session = session is None
+        if owns_session:
+            session = self.get_session()
+
+        assert session is not None
+
+        try:
             ts = float(message_data.get("ts", 0))
             message_id = f"{channel_id}_{ts}"
-            
+
             message = session.query(Message).filter_by(message_id=message_id).first()
-            
+
             if message:
                 message.text = message_data.get("text", "")
                 message.message_type = message_data.get("type", "message")
@@ -338,11 +359,11 @@ class DatabaseManager:
                 message.blocks = message_data.get("blocks")
                 message.attachments = message_data.get("attachments")
                 message.raw_data = message_data
-                
+
                 if "edited" in message_data:
                     message.is_edited = True
                     message.edited_ts = float(message_data["edited"].get("ts", 0))
-                
+
                 message.updated_at = datetime.utcnow()
             else:
                 message = Message(
@@ -359,18 +380,24 @@ class DatabaseManager:
                     reply_users_count=message_data.get("reply_users_count", 0),
                     blocks=message_data.get("blocks"),
                     attachments=message_data.get("attachments"),
-                    raw_data=message_data
+                    raw_data=message_data,
                 )
                 session.add(message)
-            
+
             # Handle reactions
             if "reactions" in message_data:
                 for reaction_data in message_data["reactions"]:
                     self._save_reactions(session, message_id, reaction_data)
-            
-            session.commit()
-            session.refresh(message)
+
+            if commit:
+                session.commit()
+                session.refresh(message)
+
             return message
+
+        finally:
+            if owns_session:
+                session.close()
     
     def _save_reactions(self, session: Session, message_id: str, reaction_data: Dict[str, Any]):
         """Save reactions for a message."""
@@ -378,11 +405,29 @@ class DatabaseManager:
         users = reaction_data.get("users", [])
         
         for user_id in users:
+            if self.engine.dialect.name == "postgresql":
+                stmt = (
+                    pg_insert(Reaction.__table__)
+                    .values(message_id=message_id, user_id=user_id, emoji_name=emoji)
+                    .on_conflict_do_nothing(index_elements=["message_id", "user_id", "emoji_name"])
+                )
+                session.execute(stmt)
+                continue
+
+            # Fallback for non-Postgres backends (e.g. tests)
             try:
+                existing = (
+                    session.query(Reaction)
+                    .filter_by(message_id=message_id, user_id=user_id, emoji_name=emoji)
+                    .first()
+                )
+                if existing:
+                    continue
+
                 reaction = Reaction(
                     message_id=message_id,
                     user_id=user_id,
-                    emoji_name=emoji
+                    emoji_name=emoji,
                 )
                 session.add(reaction)
             except IntegrityError:

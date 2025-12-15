@@ -1,5 +1,6 @@
 import { useEffect, useState, useRef } from 'react'
 import { API_BASE_URL } from '../../lib/api'
+import { SearchableSelect } from '../common/SearchableSelect'
 
 interface SlackPipelineStats {
   users: number
@@ -97,6 +98,12 @@ export default function PipelinesInterface() {
   const [slackRunId, setSlackRunId] = useState<string | null>(null)
   const [slackRunStatus, setSlackRunStatus] = useState<string | null>(null)
   const [slackIsRunning, setSlackIsRunning] = useState(false)
+  const [slackListRefreshing, setSlackListRefreshing] = useState(false)
+  const [slackListProgress, setSlackListProgress] = useState<number | null>(null)
+  const [slackListRunId, setSlackListRunId] = useState<string | null>(null)
+  const [slackListRunStatus, setSlackListRunStatus] = useState<string | null>(null)
+  const [slackChannelRunStatus, setSlackChannelRunStatus] = useState<string | null>(null)
+  const [slackChannelProgress, setSlackChannelProgress] = useState<number | null>(null)
   const [slackMessages, setSlackMessages] = useState<SlackMessage[]>([])
   // Channel list search
   const [slackSearchQuery, setSlackSearchQuery] = useState('')
@@ -131,6 +138,73 @@ export default function PipelinesInterface() {
   const gmailMessagesEndRef = useRef<HTMLDivElement | null>(null)
   const slackMessagesContainerRef = useRef<HTMLDivElement | null>(null)
   const gmailMessagesContainerRef = useRef<HTMLDivElement | null>(null)
+
+  const handleRefreshChannelList = async () => {
+    try {
+      setError(null)
+      setSlackListRefreshing(true)
+      setSlackListProgress(0)
+      setSlackListRunStatus('starting')
+      const params = new URLSearchParams({
+        include_archived: 'false',
+      })
+      const response = await fetch(
+        `${API_BASE_URL}/api/pipelines/slack/channels/refresh?${params.toString()}`,
+        {
+          method: 'POST',
+          credentials: 'include',
+        },
+      )
+      if (!response.ok) {
+        throw new Error(`Failed to refresh channel list: ${response.status}`)
+      }
+      const data = await response.json()
+      const runId = data.run_id as string
+      setSlackListRunId(runId)
+      setSlackListRunStatus(data.status || 'started')
+      pollSlackListRunStatus(runId)
+    } catch (err: any) {
+      console.error('Error refreshing channel list:', err)
+      setError(err.message || 'Failed to refresh channel list')
+    } finally {
+      // leave refreshing flag to poller to clear on completion
+    }
+  }
+
+  const pollSlackListRunStatus = async (id: string) => {
+    let done = false
+    while (!done) {
+      try {
+        const response = await fetch(`${API_BASE_URL}/api/pipelines/slack/status/${id}`, {
+          credentials: 'include',
+        })
+        if (!response.ok) {
+          throw new Error(`Failed to fetch channel-list run status: ${response.status}`)
+        }
+        const data = await response.json()
+        setSlackListRunStatus(data.status)
+        const progressVal =
+          data?.stats?.progress != null ? Math.min(1, Math.max(0, data.stats.progress)) : null
+        setSlackListProgress(progressVal)
+
+        if (['completed', 'failed', 'cancelled'].includes(data.status)) {
+          done = true
+          setSlackListRefreshing(false)
+          setSlackIsRunning(false)
+          setSlackListProgress(progressVal ?? 1)
+          await fetchSlackData()
+          setSlackListRunId(null)
+        } else {
+          await new Promise((resolve) => setTimeout(resolve, 2000))
+        }
+      } catch (err: any) {
+        console.error('Error polling Slack channel-list status:', err)
+        setError(err.message || 'Failed to poll channel list status')
+        setSlackListRefreshing(false)
+        done = true
+      }
+    }
+  }
 
   // Restore persisted Pipelines UI state on mount
   useEffect(() => {
@@ -230,6 +304,80 @@ export default function PipelinesInterface() {
     } catch (err: any) {
       console.error('Error loading Slack pipeline data:', err)
       setError(err.message || 'Failed to load Slack data')
+    }
+  }
+
+  const pollSlackChannelRunStatus = async (id: string) => {
+    let done = false
+    while (!done) {
+      try {
+        const response = await fetch(`${API_BASE_URL}/api/pipelines/slack/channel/status/${id}`, {
+          credentials: 'include',
+        })
+        if (!response.ok) {
+          throw new Error(`Failed to fetch channel run status: ${response.status}`)
+        }
+        const data = await response.json()
+        setSlackChannelRunStatus(data.status)
+        const progressVal =
+          data?.stats?.progress != null ? Math.min(1, Math.max(0, data.stats.progress)) : null
+        setSlackChannelProgress(progressVal)
+
+        if (['completed', 'failed', 'cancelled'].includes(data.status)) {
+          done = true
+          setSlackIsRunning(false)
+          if (data.finished_at || data.started_at) {
+            setSlackLastRunAt(data.finished_at || data.started_at)
+          } else {
+            setSlackLastRunAt(new Date().toISOString())
+          }
+          await fetchSlackData()
+          if (selectedChannelId) {
+            await fetchSlackMessages(selectedChannelId)
+          }
+        } else {
+          await new Promise((resolve) => setTimeout(resolve, 2000))
+        }
+      } catch (err: any) {
+        console.error('Error polling Slack channel pipeline status:', err)
+        setError(err.message || 'Failed to poll channel run status')
+        setSlackIsRunning(false)
+        done = true
+      }
+    }
+  }
+
+  const handleRunSlackChannel = async (channelId: string) => {
+    try {
+      setError(null)
+      setSlackIsRunning(true)
+      setSlackChannelRunStatus('starting')
+      setSlackChannelProgress(null)
+
+      const params = new URLSearchParams({
+        channel_id: channelId,
+        include_threads: 'false',
+        lookback_hours: '24',
+      })
+
+      const response = await fetch(`${API_BASE_URL}/api/pipelines/slack/channel/run?${params.toString()}`, {
+        method: 'POST',
+        credentials: 'include',
+      })
+
+      if (!response.ok) {
+        throw new Error(`Failed to start Slack channel refresh: ${response.status}`)
+      }
+
+      const data = await response.json()
+      const newRunId = data.run_id as string
+      setSlackChannelRunStatus(data.status || 'started')
+
+      pollSlackChannelRunStatus(newRunId)
+    } catch (err: any) {
+      console.error('Error starting Slack channel refresh:', err)
+      setError(err.message || 'Failed to start Slack channel refresh')
+      setSlackIsRunning(false)
     }
   }
 
@@ -738,260 +886,319 @@ export default function PipelinesInterface() {
   // Render helpers
   // -----------------------------
 
-  const renderSlackView = () => (
-    <>
-      <div className="w-80 border-r border-border bg-card p-4 flex flex-col gap-4">
-        <div>
-          <h2 className="text-lg font-semibold mb-2">Slack Pipeline</h2>
-          <p className="text-sm text-muted-foreground mb-3">
-            Manually sync Slack workspace history (users, channels, messages, files) into the database.
-          </p>
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={handleRunSlackPipeline}
-              disabled={slackIsRunning}
-              className="inline-flex items-center justify-center rounded-md bg-blue-600 px-3 py-1.5 text-sm font-medium text-white shadow-sm hover:bg-blue-700 disabled:opacity-60 disabled:cursor-not-allowed"
-            >
-              {slackIsRunning ? 'Running…' : 'Run Slack Pipeline'}
-            </button>
-            {slackIsRunning && slackRunId && (
+  const renderSlackView = () => {
+    const channelProgressDisplay =
+      slackChannelRunStatus || slackChannelProgress != null
+        ? `Refresh status: ${slackChannelRunStatus || 'running'}${
+            slackChannelProgress != null ? ` · ${(slackChannelProgress * 100).toFixed(0)}%` : ''
+          }`
+        : null
+
+    const channelListProgressDisplay =
+      slackListRefreshing || slackListRunStatus || slackListProgress != null
+        ? `${slackListRunStatus || 'running'}${
+            slackListProgress != null ? ` · ${(slackListProgress * 100).toFixed(0)}%` : ''
+          }`
+        : null
+
+    return (
+      <>
+        <div className="w-80 border-r border-border bg-card p-4 flex flex-col gap-4">
+          <div>
+            <h2 className="text-lg font-semibold mb-2">Slack Pipeline</h2>
+            <p className="text-sm text-muted-foreground mb-3">
+              Manually sync Slack workspace history (users, channels, messages, files) into the
+              database.
+            </p>
+            <div className="flex items-center gap-2">
               <button
                 type="button"
-                onClick={handleStopSlackPipeline}
-                className="inline-flex items-center justify-center rounded-md bg-red-600 px-2 py-1 text-xs font-medium text-white shadow-sm hover:bg-red-700"
+                onClick={handleRunSlackPipeline}
+                disabled={slackIsRunning}
+                className="inline-flex items-center justify-center rounded-md bg-blue-600 px-3 py-1.5 text-sm font-medium text-white shadow-sm hover:bg-blue-700 disabled:opacity-60 disabled:cursor-not-allowed"
               >
-                Stop
+                {slackIsRunning ? 'Running…' : 'Run Slack Pipeline'}
               </button>
+              {slackIsRunning && slackRunId && (
+                <button
+                  type="button"
+                  onClick={handleStopSlackPipeline}
+                  className="inline-flex items-center justify-center rounded-md bg-red-600 px-2 py-1 text-xs font-medium text-white shadow-sm hover:bg-red-700"
+                >
+                  Stop
+                </button>
+              )}
+            </div>
+            {slackRunStatus && (
+              <p className="mt-2 text-xs text-muted-foreground">
+                Run status: <span className="font-medium">{slackRunStatus}</span>
+              </p>
+            )}
+            {slackRunId && (
+              <p className="mt-1 text-[11px] text-muted-foreground break-all">Run ID: {slackRunId}</p>
+            )}
+            {channelProgressDisplay && (
+              <p className="mt-1 text-[11px] text-muted-foreground">{channelProgressDisplay}</p>
             )}
           </div>
-          {slackRunStatus && (
-            <p className="mt-2 text-xs text-muted-foreground">
-              Run status: <span className="font-medium">{slackRunStatus}</span>
-            </p>
-          )}
-          {slackRunId && (
-            <p className="mt-1 text-[11px] text-muted-foreground break-all">Run ID: {slackRunId}</p>
+
+          {slackStats && (
+            <div className="mt-2 rounded-md border border-border bg-background p-3">
+              <h3 className="text-sm font-semibold mb-2">Slack Stats</h3>
+              <dl className="grid grid-cols-2 gap-1 text-xs">
+                <div>
+                  <dt className="text-muted-foreground">Users</dt>
+                  <dd className="font-medium">{slackStats.users}</dd>
+                </div>
+                <div>
+                  <dt className="text-muted-foreground">Channels</dt>
+                  <dd className="font-medium">{slackStats.channels}</dd>
+                </div>
+                <div>
+                  <dt className="text-muted-foreground">Messages</dt>
+                  <dd className="font-medium">{slackStats.messages}</dd>
+                </div>
+                <div>
+                  <dt className="text-muted-foreground">Files</dt>
+                  <dd className="font-medium">{slackStats.files}</dd>
+                </div>
+                <div>
+                  <dt className="text-muted-foreground">Reactions</dt>
+                  <dd className="font-medium">{slackStats.reactions}</dd>
+                </div>
+              </dl>
+              {slackLastRunAt && (
+                <p className="mt-2 text-[11px] text-muted-foreground">
+                  Last run: {new Date(slackLastRunAt).toLocaleString()}
+                </p>
+              )}
+            </div>
           )}
         </div>
 
-        {slackStats && (
-          <div className="mt-2 rounded-md border border-border bg-background p-3">
-            <h3 className="text-sm font-semibold mb-2">Slack Stats</h3>
-            <dl className="grid grid-cols-2 gap-1 text-xs">
-              <div>
-                <dt className="text-muted-foreground">Users</dt>
-                <dd className="font-medium">{slackStats.users}</dd>
-              </div>
-              <div>
-                <dt className="text-muted-foreground">Channels</dt>
-                <dd className="font-medium">{slackStats.channels}</dd>
-              </div>
-              <div>
-                <dt className="text-muted-foreground">Messages</dt>
-                <dd className="font-medium">{slackStats.messages}</dd>
-              </div>
-              <div>
-                <dt className="text-muted-foreground">Files</dt>
-                <dd className="font-medium">{slackStats.files}</dd>
-              </div>
-              <div>
-                <dt className="text-muted-foreground">Reactions</dt>
-                <dd className="font-medium">{slackStats.reactions}</dd>
-              </div>
-            </dl>
-            {slackLastRunAt && (
-              <p className="mt-2 text-[11px] text-muted-foreground">
-                Last run: {new Date(slackLastRunAt).toLocaleString()}
-              </p>
-            )}
-          </div>
-        )}
-      </div>
-
-      <div className="flex-1 p-4 overflow-hidden flex flex-col">
-        <h2 className="text-lg font-semibold mb-3">Slack Channels</h2>
-        <div className="flex-1 flex overflow-hidden gap-4">
-          <div className="w-80 border border-border rounded-md bg-card flex flex-col">
-            <div className="p-2 border-b border-border flex items-center gap-2">
-              <input
-                type="text"
-                value={slackSearchQuery}
-                onChange={(e) => setSlackSearchQuery(e.target.value)}
-                placeholder="Search channels and messages"
-                className="flex-1 rounded-md border border-border bg-background px-2 py-1 text-xs"
-              />
-              <span className="text-[11px] text-muted-foreground whitespace-nowrap">
-                {filteredChannels.length} channels
-              </span>
+        <div className="flex-1 p-4 overflow-hidden flex flex-col">
+          <div className="flex items-center justify-between mb-3 gap-2">
+            <div className="flex items-center gap-2">
+              <h2 className="text-lg font-semibold">Slack Channels</h2>
+              {channelListProgressDisplay && (
+                <span className="text-[11px] text-muted-foreground">
+                  {channelListProgressDisplay}
+                  {slackListRunId ? ` · run ${slackListRunId.slice(0, 8)}` : ''}
+                </span>
+              )}
             </div>
-            <div className="flex-1 overflow-auto">
-              <table className="min-w-full text-xs">
-                <thead className="bg-muted">
-                  <tr>
-                    <th className="px-3 py-2 text-left font-medium text-muted-foreground">Channel</th>
-                    <th className="px-3 py-2 text-right font-medium text-muted-foreground">Messages</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {filteredChannels.map((ch) => (
-                  <tr
-                    key={ch.channel_id}
-                    className={
-                      'cursor-pointer border-b border-border/60 hover:bg-muted ' +
-                      (selectedChannelId === ch.channel_id ? 'bg-muted/80' : '')
-                    }
-                    onClick={() => {
-                      setSelectedChannelId(ch.channel_id)
-                      fetchSlackMessages(ch.channel_id)
-                    }}
-                  >
-                    <td className="px-3 py-2 align-top">
-                      <div className="font-medium text-foreground text-xs">
-                        {ch.name || ch.channel_id}
-                        {ch.is_private && (
-                          <span className="ml-1 text-[10px] text-yellow-400">(private)</span>
-                        )}
-                      </div>
-                      <div className="text-[11px] text-muted-foreground">
-                        {ch.num_members != null ? `${ch.num_members} members` : 'Members unknown'}
-                        {ch.is_archived && (
-                          <span className="ml-1 text-[10px] text-red-400">archived</span>
-                        )}
-                      </div>
-                    </td>
-                    <td className="px-3 py-2 text-right align-top text-xs">{ch.message_count}</td>
-                  </tr>
-                ))}
-                {filteredChannels.length === 0 && (
-                  <tr>
-                    <td colSpan={2} className="px-3 py-4 text-center text-xs text-muted-foreground">
-                      No Slack channels match this search.
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-            </div>
+            <button
+              type="button"
+              onClick={handleRefreshChannelList}
+              disabled={slackListRefreshing || slackIsRunning}
+              className="inline-flex items-center justify-center rounded-md bg-blue-600 px-2.5 py-1.5 text-xs font-medium text-white shadow-sm hover:bg-blue-700 disabled:opacity-60 disabled:cursor-not-allowed"
+            >
+              {slackListRefreshing
+                ? `Refreshing ${slackListProgress != null ? `${(slackListProgress * 100).toFixed(0)}%` : '…'}`
+                : 'Refresh channel list'}
+            </button>
           </div>
-
-          <div
-            className="flex-1 border border-border rounded-md bg-card p-4 overflow-auto"
-            ref={slackMessagesContainerRef}
-          >
-            {selectedChannel ? (
-              <div className="flex flex-col h-full">
-                <div className="mb-3">
-                  <h3 className="text-base font-semibold mb-1">Channel Details</h3>
-                  <p className="text-sm mb-1">
-                    <span className="font-mono text-sm">
-                      {selectedChannel.name || selectedChannel.channel_id}
-                    </span>
-                    {selectedChannel.is_private && (
-                      <span className="ml-2 text-xs text-yellow-400">Private</span>
-                    )}
-                    {selectedChannel.is_archived && (
-                      <span className="ml-2 text-xs text-red-400">Archived</span>
-                    )}
-                  </p>
-                  <p className="text-xs text-muted-foreground mb-2">
-                    Members:{' '}
-                    {selectedChannel.num_members != null
-                      ? selectedChannel.num_members
-                      : 'Unknown'}{' '}
-                    · Messages: {selectedChannel.message_count}
-                  </p>
-                </div>
-
-                <div className="flex-1 border border-border rounded-md bg-background p-2 flex flex-col">
-                  {slackMessages.length === 0 ? (
-                    <p className="text-xs text-muted-foreground">
-                      No messages loaded for this channel yet. Run the Slack pipeline or select the
-                      channel again.
-                    </p>
-                  ) : (
-                    <>
-                      <div className="mb-2 flex items-center justify-between gap-2">
-                        <input
-                          type="text"
-                          value={slackMessageSearchQuery}
-                          onChange={(e) => setSlackMessageSearchQuery(e.target.value)}
-                          placeholder="Filter by text or user"
-                          className="flex-1 rounded-md border border-border bg-background px-2 py-1 text-xs"
-                        />
-                        <span className="text-[11px] text-muted-foreground whitespace-nowrap">
-                          {filteredSlackMessages.length} shown / {slackMessages.length} loaded
-                        </span>
-                      </div>
-                      <div className="flex-1 overflow-auto space-y-3">
-                        {Object.entries(groupedSlackThreads).map(([key, thread]) => (
-                          <div key={key} className="rounded-md border border-border/60 bg-card p-2">
-                            {thread.root && (
-                              <div className="mb-1">
-                                <div className="flex items-center justify-between gap-2">
-                                  <div className="text-xs font-semibold text-foreground">
-                                    {thread.root.user_name ||
-                                      thread.root.user_id ||
-                                      'Unknown user'}
-                                  </div>
-                                  <div className="text-[10px] text-muted-foreground">
-                                    {new Date(thread.root.timestamp * 1000).toLocaleString()}
-                                  </div>
-                                </div>
-                                <p className="text-xs text-foreground whitespace-pre-wrap">
-                                  {thread.root.text || '[no text]'}
-                                </p>
-                                {thread.root.reply_count ? (
-                                  <p className="mt-1 text-[10px] text-muted-foreground">
-                                    {thread.root.reply_count} repl
-                                    {thread.root.reply_count === 1 ? 'y' : 'ies'}
-                                  </p>
-                                ) : null}
-                              </div>
-                            )}
-
-                            {thread.replies.length > 0 && (
-                              <div className="mt-2 border-t border-border/40 pt-2 space-y-1">
-                                {[...thread.replies]
-                                  .sort((a, b) => a.timestamp - b.timestamp)
-                                  .map((reply) => (
-                                    <div
-                                      key={reply.message_id}
-                                      className="pl-2 border-l border-border/40"
-                                    >
-                                      <div className="flex items-center justify-between gap-2">
-                                        <div className="text-[11px] font-medium text-foreground">
-                                          {reply.user_name || reply.user_id || 'Unknown user'}
-                                        </div>
-                                        <div className="text-[10px] text-muted-foreground">
-                                          {new Date(reply.timestamp * 1000).toLocaleString()}
-                                        </div>
-                                      </div>
-                                      <p className="text-[11px] text-foreground whitespace-pre-wrap">
-                                        {reply.text || '[no text]'}
-                                      </p>
-                                    </div>
-                                  ))}
-                              </div>
+          <div className="flex-1 flex overflow-hidden gap-4">
+            <div className="w-80 border border-border rounded-md bg-card flex flex-col">
+              <div className="p-2 border-b border-border flex items-center gap-2">
+                <input
+                  type="text"
+                  value={slackSearchQuery}
+                  onChange={(e) => setSlackSearchQuery(e.target.value)}
+                  placeholder="Search channels and messages"
+                  className="flex-1 rounded-md border border-border bg-background px-2 py-1 text-xs"
+                />
+                <span className="text-[11px] text-muted-foreground whitespace-nowrap">
+                  {filteredChannels.length} channels
+                </span>
+              </div>
+              <div className="flex-1 overflow-auto">
+                <table className="min-w-full text-xs">
+                  <thead className="bg-muted">
+                    <tr>
+                      <th className="px-3 py-2 text-left font-medium text-muted-foreground">Channel</th>
+                      <th className="px-3 py-2 text-right font-medium text-muted-foreground">Messages</th>
+                      <th className="px-3 py-2 text-right font-medium text-muted-foreground">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filteredChannels.map((ch) => (
+                      <tr
+                        key={ch.channel_id}
+                        className={
+                          'border-b border-border/60 hover:bg-muted ' +
+                          (selectedChannelId === ch.channel_id ? 'bg-muted/80' : '')
+                        }
+                      >
+                        <td
+                          className="px-3 py-2 align-top cursor-pointer"
+                          onClick={() => {
+                            setSelectedChannelId(ch.channel_id)
+                            fetchSlackMessages(ch.channel_id)
+                          }}
+                        >
+                          <div className="font-medium text-foreground text-xs">
+                            {ch.name || ch.channel_id}
+                            {ch.is_private && (
+                              <span className="ml-1 text-[10px] text-yellow-400">(private)</span>
                             )}
                           </div>
-                        ))}
-                        <div ref={slackMessagesEndRef} />
-                      </div>
-                    </>
-                  )}
-                </div>
+                          <div className="text-[11px] text-muted-foreground">
+                            {ch.num_members != null ? `${ch.num_members} members` : 'Members unknown'}
+                            {ch.is_archived && (
+                              <span className="ml-1 text-[10px] text-red-400">archived</span>
+                            )}
+                          </div>
+                        </td>
+                        <td className="px-3 py-2 text-right align-top text-xs">{ch.message_count}</td>
+                        <td className="px-3 py-2 text-right align-top">
+                          <button
+                            type="button"
+                            onClick={() => handleRunSlackChannel(ch.channel_id)}
+                            disabled={slackIsRunning}
+                            className="inline-flex items-center justify-center rounded-md bg-blue-600 px-2 py-1 text-[11px] font-medium text-white shadow-sm hover:bg-blue-700 disabled:opacity-60 disabled:cursor-not-allowed"
+                          >
+                            Refresh
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                    {filteredChannels.length === 0 && (
+                      <tr>
+                        <td colSpan={3} className="px-3 py-4 text-center text-xs text-muted-foreground">
+                          No Slack channels match this search.
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
               </div>
-            ) : (
-              <p className="text-sm text-muted-foreground">
-                Select a channel on the left to see details.
-              </p>
-            )}
+            </div>
+
+            <div
+              className="flex-1 border border-border rounded-md bg-card p-4 overflow-auto"
+              ref={slackMessagesContainerRef}
+            >
+              {selectedChannel ? (
+                <div className="flex flex-col h-full">
+                  <div className="mb-3">
+                    <h3 className="text-base font-semibold mb-1">Channel Details</h3>
+                    <p className="text-sm mb-1">
+                      <span className="font-mono text-sm">
+                        {selectedChannel.name || selectedChannel.channel_id}
+                      </span>
+                      {selectedChannel.is_private && (
+                        <span className="ml-2 text-xs text-yellow-400">Private</span>
+                      )}
+                      {selectedChannel.is_archived && (
+                        <span className="ml-2 text-xs text-red-400">Archived</span>
+                      )}
+                    </p>
+                    <p className="text-xs text-muted-foreground mb-2">
+                      Members:{' '}
+                      {selectedChannel.num_members != null ? selectedChannel.num_members : 'Unknown'} ·
+                      Messages: {selectedChannel.message_count}
+                    </p>
+                    {slackChannelRunStatus && (
+                      <p className="text-[11px] text-muted-foreground">
+                        Refresh status: {slackChannelRunStatus}
+                        {slackChannelProgress != null
+                          ? ` · ${(slackChannelProgress * 100).toFixed(0)}%`
+                          : ''}
+                      </p>
+                    )}
+                  </div>
+
+                  <div className="flex-1 border border-border rounded-md bg-background p-2 flex flex-col">
+                    {slackMessages.length === 0 ? (
+                      <p className="text-xs text-muted-foreground">
+                        No messages loaded for this channel yet. Run the Slack pipeline or select the
+                        channel again.
+                      </p>
+                    ) : (
+                      <>
+                        <div className="mb-2 flex items-center justify-between gap-2">
+                          <input
+                            type="text"
+                            value={slackMessageSearchQuery}
+                            onChange={(e) => setSlackMessageSearchQuery(e.target.value)}
+                            placeholder="Filter by text or user"
+                            className="flex-1 rounded-md border border-border bg-background px-2 py-1 text-xs"
+                          />
+                          <span className="text-[11px] text-muted-foreground whitespace-nowrap">
+                            {filteredSlackMessages.length} shown / {slackMessages.length} loaded
+                          </span>
+                        </div>
+                        <div className="flex-1 overflow-auto space-y-3">
+                          {Object.entries(groupedSlackThreads).map(([key, thread]) => (
+                            <div key={key} className="rounded-md border border-border/60 bg-card p-2">
+                              {thread.root && (
+                                <div className="mb-1">
+                                  <div className="flex items-center justify-between gap-2">
+                                    <div className="text-xs font-semibold text-foreground">
+                                      {thread.root.user_name ||
+                                        thread.root.user_id ||
+                                        'Unknown user'}
+                                    </div>
+                                    <div className="text-[10px] text-muted-foreground">
+                                      {new Date(thread.root.timestamp * 1000).toLocaleString()}
+                                    </div>
+                                  </div>
+                                  <p className="text-xs text-foreground whitespace-pre-wrap">
+                                    {thread.root.text || '[no text]'}
+                                  </p>
+                                  {thread.root.reply_count ? (
+                                    <p className="mt-1 text-[10px] text-muted-foreground">
+                                      {thread.root.reply_count} repl
+                                      {thread.root.reply_count === 1 ? 'y' : 'ies'}
+                                    </p>
+                                  ) : null}
+                                </div>
+                              )}
+
+                              {thread.replies.length > 0 && (
+                                <div className="mt-2 border-t border-border/40 pt-2 space-y-1">
+                                  {[...thread.replies]
+                                    .sort((a, b) => a.timestamp - b.timestamp)
+                                    .map((reply) => (
+                                      <div
+                                        key={reply.message_id}
+                                        className="pl-2 border-l border-border/40"
+                                      >
+                                        <div className="flex items-center justify-between gap-2">
+                                          <div className="text-[11px] font-medium text-foreground">
+                                            {reply.user_name || reply.user_id || 'Unknown user'}
+                                          </div>
+                                          <div className="text-[10px] text-muted-foreground">
+                                            {new Date(reply.timestamp * 1000).toLocaleString()}
+                                          </div>
+                                        </div>
+                                        <p className="text-[11px] text-foreground whitespace-pre-wrap">
+                                          {reply.text || '[no text]'}
+                                        </p>
+                                      </div>
+                                    ))}
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                          <div ref={slackMessagesEndRef} />
+                        </div>
+                      </>
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <p className="text-sm text-muted-foreground">
+                  Select a channel on the left to see details.
+                </p>
+              )}
+            </div>
           </div>
         </div>
-      </div>
-    </>
-  )
+      </>
+    )
+  }
 
   const renderGmailView = () => {
     const search = gmailSearchQuery.trim().toLowerCase()
@@ -1030,19 +1237,17 @@ export default function PipelinesInterface() {
           >
             Label
           </label>
-          <select
+          <SearchableSelect
             id="gmail-label-select"
-            className="w-full rounded-md border border-border bg-background px-2 py-1 text-xs mb-2"
             value={selectedLabelId}
-            onChange={(e) => setSelectedLabelId(e.target.value)}
-          >
-            <option value="">Select a label…</option>
-            {gmailLabels.map((lbl) => (
-              <option key={lbl.id} value={lbl.id}>
-                {lbl.name}
-              </option>
-            ))}
-          </select>
+            onChange={setSelectedLabelId}
+            options={gmailLabels.map((lbl) => ({ value: lbl.id, label: lbl.name }))}
+            placeholder="Select a label…"
+            searchPlaceholder="Search labels…"
+            allowClear
+            fullWidth
+            containerClassName="mb-2"
+          />
 
           <div className="flex items-center gap-2">
             <button

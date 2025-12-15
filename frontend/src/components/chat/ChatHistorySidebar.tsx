@@ -2,10 +2,21 @@ import { useEffect, useState } from 'react'
 import { useChatStore, ChatSession } from '../../store/chatStore'
 import { API_BASE_URL } from '../../lib/api'
 import { MessageSquare, Plus, Trash2, Loader2 } from 'lucide-react'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 
 export default function ChatHistorySidebar() {
   const { currentSessionId, setCurrentSessionId, createNewSession, setSessions, sessions, loadSessionMessages, deleteSession } = useChatStore()
   const [loading, setLoading] = useState(false)
+  const [deleteTargetId, setDeleteTargetId] = useState<string | null>(null)
 
   // Load sessions on mount
   useEffect(() => {
@@ -54,11 +65,7 @@ export default function ChatHistorySidebar() {
     }
   }
 
-  const handleDeleteSession = async (sessionId: string, event: React.MouseEvent) => {
-    event.stopPropagation()
-    
-    if (!confirm('Delete this conversation?')) return
-
+  const handleDeleteSession = async (sessionId: string) => {
     try {
       // Use store's deleteSession which handles everything
       deleteSession(sessionId)
@@ -71,6 +78,34 @@ export default function ChatHistorySidebar() {
 
   return (
     <div className="flex h-full flex-col bg-gray-900 text-white">
+      <AlertDialog
+        open={deleteTargetId !== null}
+        onOpenChange={(open: boolean) => !open && setDeleteTargetId(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete conversation?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This will permanently delete the chat session and its messages.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel onClick={() => setDeleteTargetId(null)}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-red-600 hover:bg-red-700"
+              onClick={async () => {
+                if (!deleteTargetId) return
+                const id = deleteTargetId
+                setDeleteTargetId(null)
+                await handleDeleteSession(id)
+              }}
+            >
+              Delete
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
       {/* Header */}
       <div className="border-b border-gray-800 p-4">
         <button
@@ -114,7 +149,10 @@ export default function ChatHistorySidebar() {
                   </div>
                 </div>
                 <button
-                  onClick={(e) => handleDeleteSession(session.session_id, e)}
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    setDeleteTargetId(session.session_id)
+                  }}
                   className="flex-shrink-0 opacity-0 transition-opacity group-hover:opacity-100 hover:text-red-400"
                   title="Delete conversation"
                   aria-label="Delete conversation"

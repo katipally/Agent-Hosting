@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react'
 import { Eye, EyeOff } from 'lucide-react'
 import { useAuthStore } from '../../store/authStore'
 import { API_BASE_URL } from '../../lib/api'
+import { SearchableSelect } from '../common/SearchableSelect'
 
 type WorkspaceSettingsView = {
   system: {
@@ -1274,16 +1275,19 @@ const ProfileInterface: React.FC = () => {
                     >
                       Mode
                     </label>
-                    <select
+                    <SearchableSelect
                       id="slack-mode"
-                      className="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary"
                       value={workspaceForm.slackMode}
-                      onChange={(e) => handleWorkspaceChange('slackMode', e.target.value)}
-                    >
-                      <option value="read_only">read_only</option>
-                      <option value="standard">standard</option>
-                      <option value="admin">admin</option>
-                    </select>
+                      onChange={(next) => handleWorkspaceChange('slackMode', next)}
+                      options={[
+                        { value: 'read_only', label: 'read_only' },
+                        { value: 'standard', label: 'standard' },
+                        { value: 'admin', label: 'admin' },
+                      ]}
+                      searchPlaceholder="Search Slack modes…"
+                      fullWidth
+                      triggerClassName="px-3 py-1.5 text-sm"
+                    />
                   </div>
                   <div>
                     <label
@@ -1627,15 +1631,18 @@ const ProfileInterface: React.FC = () => {
                     >
                       Mode
                     </label>
-                    <select
+                    <SearchableSelect
                       id="notion-mode"
-                      className="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary"
                       value={workspaceForm.notionMode}
-                      onChange={(e) => handleWorkspaceChange('notionMode', e.target.value)}
-                    >
-                      <option value="standard">standard</option>
-                      <option value="read_only">read_only</option>
-                    </select>
+                      onChange={(next) => handleWorkspaceChange('notionMode', next)}
+                      options={[
+                        { value: 'standard', label: 'standard' },
+                        { value: 'read_only', label: 'read_only' },
+                      ]}
+                      searchPlaceholder="Search Notion modes…"
+                      fullWidth
+                      triggerClassName="px-3 py-1.5 text-sm"
+                    />
                     <p className="mt-1 text-[11px] text-muted-foreground">
                       Controls how the agent interacts with Notion (read-only vs standard).
                     </p>
@@ -1666,16 +1673,19 @@ const ProfileInterface: React.FC = () => {
                     >
                       Send mode
                     </label>
-                    <select
+                    <SearchableSelect
                       id="gmail-send-mode"
-                      className="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary"
                       value={workspaceForm.gmailSendMode}
-                      onChange={(e) => handleWorkspaceChange('gmailSendMode', e.target.value)}
-                    >
-                      <option value="draft">draft (never send)</option>
-                      <option value="confirm">confirm (default)</option>
-                      <option value="auto_limited">auto_limited</option>
-                    </select>
+                      onChange={(next) => handleWorkspaceChange('gmailSendMode', next)}
+                      options={[
+                        { value: 'draft', label: 'draft (never send)' },
+                        { value: 'confirm', label: 'confirm (default)' },
+                        { value: 'auto_limited', label: 'auto_limited' },
+                      ]}
+                      searchPlaceholder="Search Gmail send modes…"
+                      fullWidth
+                      triggerClassName="px-3 py-1.5 text-sm"
+                    />
                   </div>
                   <div>
                     <label

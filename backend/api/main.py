@@ -59,6 +59,7 @@ from urllib.parse import urlencode
 import requests
 from sqlalchemy import cast, or_
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import Session
 from google.oauth2 import id_token as google_id_token
 from google.auth.transport import requests as google_requests
 from google.oauth2.credentials import Credentials
@@ -100,6 +101,10 @@ from database.models import (
     PipelineRun,
 )
 from slack.extractor import ExtractionCoordinator
+from slack.extractor.channels import ChannelExtractor
+from slack.extractor.messages import MessageExtractor
+from slack.sender.message_sender import MessageSender
+from slack.sender.file_sender import FileSender
 from gmail import GmailClient
 from notion_export import NotionClient
 
@@ -3069,22 +3074,23 @@ def _run_slack_pipeline(run_id: str, include_archived: bool = False, download_fi
         else:
             _update_pipeline_run(run_id, status="completed", finished_at=datetime.utcnow(), stats=run_stats)
             logger.info("Slack pipeline run %s completed: %s", run_id, run_stats)
-            
-            # Automatically sync embeddings after successful extraction
-            try:
-                logger.info("Auto-syncing Slack embeddings...")
-                embed_stats = sync_embeddings_after_pipeline(
-                    data_source="slack",
-                    db_manager=db_manager
-                )
-                # Update stats with embedding info
-                run_stats["embedding_stats"] = embed_stats
-                _update_pipeline_run(run_id, stats=run_stats)
-                logger.info("✓ Slack embeddings synced: %s", embed_stats)
-            except Exception as embed_error:
-                logger.error(f"Embedding sync failed (non-fatal): {embed_error}")
-                run_stats["embedding_error"] = str(embed_error)
-                _update_pipeline_run(run_id, stats=run_stats)
+
+            if Config.AUTO_SYNC_EMBEDDINGS_AFTER_PIPELINE:
+                # Automatically sync embeddings after successful extraction
+                try:
+                    logger.info("Auto-syncing Slack embeddings...")
+                    embed_stats = sync_embeddings_after_pipeline(
+                        data_source="slack",
+                        db_manager=db_manager
+                    )
+                    # Update stats with embedding info
+                    run_stats["embedding_stats"] = embed_stats
+                    _update_pipeline_run(run_id, stats=run_stats)
+                    logger.info("✓ Slack embeddings synced: %s", embed_stats)
+                except Exception as embed_error:
+                    logger.error(f"Embedding sync failed (non-fatal): {embed_error}")
+                    run_stats["embedding_error"] = str(embed_error)
+                    _update_pipeline_run(run_id, stats=run_stats)
 
     except Exception as e:  # pragma: no cover - defensive logging
         logger.error(f"Slack pipeline run {run_id} failed: {e}", exc_info=True)
@@ -3123,6 +3129,194 @@ async def run_slack_pipeline(
     thread = threading.Thread(
         target=_run_slack_pipeline,
         args=(run_id, include_archived, download_files),
+        daemon=True,
+    )
+    thread.start()
+
+    return {"run_id": run_id, "status": "started"}
+
+
+def _run_slack_channel_pipeline(
+    run_id: str,
+    channel_id: str,
+    include_threads: bool = False,
+    lookback_hours: Optional[int] = 24,
+) -> None:
+    """Background worker to refresh a single Slack channel incrementally."""
+    logger.info(
+        "Starting Slack channel pipeline run %s (channel=%s, include_threads=%s, lookback_hours=%s)",
+        run_id,
+        channel_id,
+        include_threads,
+        lookback_hours,
+    )
+
+    _update_pipeline_run(run_id, status="running", started_at=datetime.utcnow())
+
+    # Determine incremental window from SyncStatus
+    sync_status = db_manager.get_sync_status(channel_id)
+    oldest = None
+    if sync_status and sync_status.last_synced_ts:
+        oldest = sync_status.last_synced_ts
+        if lookback_hours and lookback_hours > 0:
+            # Revisit a small window to capture edits/reactions
+            revisit = datetime.utcnow().timestamp() - (lookback_hours * 3600)
+            oldest = min(oldest, revisit) if oldest else revisit
+    elif lookback_hours and lookback_hours > 0:
+        oldest = datetime.utcnow().timestamp() - (lookback_hours * 3600)
+
+    extractor = MessageExtractor(db_manager=db_manager)
+
+    # Stats container
+    stats: Dict[str, Any] = {"channel_id": channel_id, "progress": 0.0}
+
+    def progress_cb(payload: Dict[str, float]):
+        # payload keys: stage, progress, total_messages, processed_messages
+        stats.update(payload)
+        _update_pipeline_run(run_id, stats=stats)
+
+    try:
+        count = extractor.extract_channel_history(
+            channel_id=channel_id,
+            oldest=oldest,
+            include_threads=include_threads,
+            progress_callback=progress_cb,
+        )
+
+        stats.update(
+            {
+                "messages": count,
+                "progress": 1.0,
+                "completed_at": datetime.utcnow().isoformat(),
+            }
+        )
+        _update_pipeline_run(
+            run_id,
+            status="completed",
+            finished_at=datetime.utcnow(),
+            stats=stats,
+        )
+        logger.info(
+            "Slack channel pipeline run %s completed: channel=%s, messages=%s",
+            run_id,
+            channel_id,
+            count,
+        )
+    except Exception as e:  # pragma: no cover - defensive logging
+        logger.error(f"Slack channel pipeline run {run_id} failed: {e}", exc_info=True)
+        _update_pipeline_run(
+            run_id,
+            status="failed",
+            finished_at=datetime.utcnow(),
+            error=str(e),
+            stats=stats,
+        )
+
+
+def _run_slack_channels_refresh(
+    run_id: str,
+    include_archived: bool = False,
+) -> None:
+    """Background worker to refresh Slack channel list only."""
+    logger.info("Starting Slack channel list refresh run %s", run_id)
+    _update_pipeline_run(run_id, status="running", started_at=datetime.utcnow())
+
+    extractor = ChannelExtractor(db_manager=db_manager)
+    stats: Dict[str, Any] = {"progress": 0.0}
+
+    def progress_cb(payload: Dict[str, Any]):
+        stats.update(payload)
+        _update_pipeline_run(run_id, stats=stats)
+
+    try:
+        count = extractor.extract_all_channels(
+            exclude_archived=not include_archived,
+            progress_callback=progress_cb,
+        )
+        stats.update({"channels": count, "progress": 1.0, "completed_at": datetime.utcnow().isoformat()})
+        _update_pipeline_run(run_id, status="completed", finished_at=datetime.utcnow(), stats=stats)
+        logger.info("Slack channel list refresh run %s completed, channels=%s", run_id, count)
+    except Exception as e:  # pragma: no cover
+        logger.error(f"Slack channel list refresh run {run_id} failed: {e}", exc_info=True)
+        _update_pipeline_run(
+            run_id,
+            status="failed",
+            finished_at=datetime.utcnow(),
+            error=str(e),
+            stats=stats,
+        )
+
+
+@app.post("/api/pipelines/slack/channel/run")
+async def run_slack_channel_pipeline(
+    channel_id: str,
+    include_threads: bool = False,
+    lookback_hours: Optional[int] = 24,
+    current_user: AppUser = Depends(get_current_user),
+):
+    """Trigger an incremental Slack pipeline run for a single channel."""
+    if not channel_id:
+        raise HTTPException(status_code=400, detail="channel_id is required")
+
+    run_id = uuid.uuid4().hex
+
+    with db_manager.get_session() as session:
+        pipeline_run = PipelineRun(
+            run_id=run_id,
+            pipeline_type="slack_channel",
+            status="pending",
+            config={
+                "channel_id": channel_id,
+                "include_threads": include_threads,
+                "lookback_hours": lookback_hours,
+            },
+        )
+        session.add(pipeline_run)
+        session.commit()
+
+    thread = threading.Thread(
+        target=_run_slack_channel_pipeline,
+        args=(run_id, channel_id, include_threads, lookback_hours),
+        daemon=True,
+    )
+    thread.start()
+
+    return {"run_id": run_id, "status": "started"}
+
+
+@app.get("/api/pipelines/slack/channel/status/{run_id}")
+async def get_slack_channel_pipeline_status(
+    run_id: str,
+    current_user: AppUser = Depends(get_current_user),
+):
+    """Get the status of a single-channel Slack pipeline run."""
+    run = _get_pipeline_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return run
+
+
+@app.post("/api/pipelines/slack/channels/refresh")
+async def refresh_slack_channel_list(
+    include_archived: bool = False,
+    current_user: AppUser = Depends(get_current_user),
+):
+    """Refresh Slack channel list only (no messages/files) with background progress."""
+    run_id = uuid.uuid4().hex
+
+    with db_manager.get_session() as session:
+        pipeline_run = PipelineRun(
+            run_id=run_id,
+            pipeline_type="slack_channels",
+            status="pending",
+            config={"include_archived": include_archived},
+        )
+        session.add(pipeline_run)
+        session.commit()
+
+    thread = threading.Thread(
+        target=_run_slack_channels_refresh,
+        args=(run_id, include_archived),
         daemon=True,
     )
     thread.start()
@@ -3367,6 +3561,8 @@ def _persist_gmail_message_from_full(
     date_val: Optional[datetime],
     body_text: str,
     body_html: str,
+    session: Optional[Session] = None,
+    commit: bool = True,
 ) -> None:
     """Upsert a GmailMessage row from a full Gmail API message."""
 
@@ -3396,58 +3592,69 @@ def _persist_gmail_message_from_full(
 
         thread_id = full_msg.get("threadId")
 
-        with db_manager.get_session() as session:
-            # Ensure the GmailThread row exists so the foreign key on
-            # GmailMessage.thread_id does not fail the insert.
-            thread = None
-            if thread_id:
-                thread = session.query(GmailThread).filter_by(thread_id=thread_id).first()
-                if not thread:
-                    thread = GmailThread(
-                        thread_id=thread_id,
-                        account_email=account_email,
-                        snippet=full_msg.get("snippet", ""),
-                        history_id=full_msg.get("historyId"),
-                    )
-                    session.add(thread)
+        owns_session = session is None
+        if owns_session:
+            session = db_manager.get_session()
 
-            msg = session.query(GmailMessage).filter_by(message_id=msg_id).first()
-            if not msg:
-                msg = GmailMessage(
-                    message_id=msg_id,
-                    account_email=account_email,
+        assert session is not None
+
+        # Ensure the GmailThread row exists so the foreign key on
+        # GmailMessage.thread_id does not fail the insert.
+        thread = None
+        if thread_id:
+            thread = session.get(GmailThread, thread_id)
+            if not thread:
+                thread = GmailThread(
                     thread_id=thread_id,
+                    account_email=account_email,
+                    snippet=full_msg.get("snippet", ""),
+                    history_id=full_msg.get("historyId"),
                 )
-                session.add(msg)
+                session.add(thread)
 
-            msg.thread_id = thread_id
-            msg.history_id = full_msg.get("historyId")
-            msg.from_address = from_raw
-            msg.to_addresses = to_raw
-            msg.cc_addresses = cc_raw
-            msg.bcc_addresses = bcc_raw
-            msg.subject = headers.get("subject", "")
-            msg.date = date_val
-            msg.body_text = body_text
-            msg.body_html = body_html
-            msg.snippet = full_msg.get("snippet", "")
-            msg.label_ids = label_ids
-            msg.is_unread = is_unread
-            msg.is_starred = is_starred
-            msg.is_important = is_important
-            msg.is_draft = is_draft
-            msg.is_sent = is_sent
-            msg.raw_data = full_msg
-            msg.updated_at = datetime.utcnow()
+        msg = session.get(GmailMessage, msg_id)
+        is_new_message = msg is None
+        if not msg:
+            msg = GmailMessage(
+                message_id=msg_id,
+                account_email=account_email,
+                thread_id=thread_id,
+            )
+            session.add(msg)
 
-            # Keep basic thread metadata in sync
-            if thread is not None:
-                thread.snippet = thread.snippet or full_msg.get("snippet", "")
-                thread.history_id = full_msg.get("historyId") or thread.history_id
-                thread.message_count = session.query(GmailMessage).filter_by(thread_id=thread_id).count()
-                thread.updated_at = datetime.utcnow()
+        msg.thread_id = thread_id
+        msg.history_id = full_msg.get("historyId")
+        msg.from_address = from_raw
+        msg.to_addresses = to_raw
+        msg.cc_addresses = cc_raw
+        msg.bcc_addresses = bcc_raw
+        msg.subject = headers.get("subject", "")
+        msg.date = date_val
+        msg.body_text = body_text
+        msg.body_html = body_html
+        msg.snippet = full_msg.get("snippet", "")
+        msg.label_ids = label_ids
+        msg.is_unread = is_unread
+        msg.is_starred = is_starred
+        msg.is_important = is_important
+        msg.is_draft = is_draft
+        msg.is_sent = is_sent
+        msg.raw_data = full_msg
+        msg.updated_at = datetime.utcnow()
 
+        # Keep basic thread metadata in sync (avoid per-message COUNT(*) queries)
+        if thread is not None:
+            thread.snippet = thread.snippet or full_msg.get("snippet", "")
+            thread.history_id = full_msg.get("historyId") or thread.history_id
+            if is_new_message:
+                thread.message_count = int(thread.message_count or 0) + 1
+            thread.updated_at = datetime.utcnow()
+
+        if commit:
             session.commit()
+
+        if owns_session:
+            session.close()
 
     except Exception as e:  # pragma: no cover - defensive logging
         logger.error(f"Failed to persist Gmail message {full_msg.get('id')}: {e}", exc_info=True)
@@ -3526,105 +3733,37 @@ def _run_gmail_pipeline(run_id: str, label_id: str, user_id: str) -> None:
     stop = False
 
     try:
-        while not stop and processed_new < max_new_messages:
-            # Cooperative cancellation support
-            if run_info.get("cancel_requested"):
-                run_info["status"] = "cancelled"
-                run_info["finished_at"] = datetime.utcnow().isoformat()
-                run_info["message_count"] = len(messages)
-                gmail_run_messages[run_id] = messages
-                logger.info("Gmail pipeline run %s cancelled", run_id)
-                return
+        commit_batch_size = max(1, int(getattr(Config, "BATCH_SIZE", 100)))
+        pending_commits = 0
 
-            batch_size = min(100, max_new_messages - processed_new)
-            result = client.list_messages(
-                max_results=batch_size,
-                page_token=page_token,
-                label_ids=[label_id],
-            )
+        with db_manager.get_session() as session:
+            while not stop and processed_new < max_new_messages:
+                # Cooperative cancellation support
+                if run_info.get("cancel_requested"):
+                    session.commit()
+                    run_info["status"] = "cancelled"
+                    run_info["finished_at"] = datetime.utcnow().isoformat()
+                    run_info["message_count"] = len(messages)
+                    gmail_run_messages[run_id] = messages
+                    logger.info("Gmail pipeline run %s cancelled", run_id)
+                    return
 
-            msg_list = result.get("messages", []) or []
-            if not msg_list:
-                break
-
-            for msg_info in msg_list:
-                if processed_new >= max_new_messages:
-                    stop = True
-                    break
-
-                msg_id = msg_info.get("id")
-                if not msg_id:
-                    continue
-
-                full_msg = client.get_message(msg_id, format="full")
-                if not full_msg:
-                    continue
-
-                internal_date_ms_str = full_msg.get("internalDate")
-                try:
-                    internal_date_ms = int(internal_date_ms_str) if internal_date_ms_str else 0
-                except Exception:
-                    internal_date_ms = 0
-
-                if last_ts_ms and internal_date_ms <= last_ts_ms:
-                    stop = True
-                    break
-
-                headers_list = full_msg.get("payload", {}).get("headers", []) or []
-                headers = {h.get("name", "").lower(): h.get("value", "") for h in headers_list}
-
-                from_raw = headers.get("from", "")
-                to_raw = headers.get("to")
-                cc_raw = headers.get("cc")
-                bcc_raw = headers.get("bcc")
-                subject = headers.get("subject", "")
-                date_str = headers.get("date")
-                try:
-                    date_val = parsedate_to_datetime(date_str) if date_str else None
-                except Exception:
-                    date_val = None
-
-                body_text, body_html = _extract_gmail_body(full_msg.get("payload", {}) or {})
-
-                # Persist into the GmailMessage table so Gmail data is durable
-                # across runs and available to the chat/RAG tools.
-                _persist_gmail_message_from_full(full_msg, client, date_val, body_text, body_html)
-
-                message_obj = {
-                    "id": msg_id,
-                    "thread_id": full_msg.get("threadId"),
-                    "from": from_raw,
-                    "to": to_raw,
-                    "cc": cc_raw,
-                    "bcc": bcc_raw,
-                    "subject": subject,
-                    "date": date_val.isoformat() if date_val else None,
-                    "snippet": full_msg.get("snippet", ""),
-                    "body_text": body_text,
-                    "body_html": body_html,
-                }
-                messages.append(message_obj)
-                processed_new += 1
-
-                if internal_date_ms > newest_ts_ms:
-                    newest_ts_ms = internal_date_ms
-
-            page_token = result.get("nextPageToken")
-            if not page_token:
-                break
-
-        # If no new messages were found for this label (common after the
-        # first incremental run), still return the latest messages so the
-        # UI always shows something useful.
-        if not messages:
-            try:
-                fallback_result = client.list_messages(
-                    max_results=50,
+                batch_size = min(100, max_new_messages - processed_new)
+                result = client.list_messages(
+                    max_results=batch_size,
+                    page_token=page_token,
                     label_ids=[label_id],
                 )
-                fallback_list = fallback_result.get("messages", []) or []
 
-                for msg_info in fallback_list:
+                msg_list = result.get("messages", []) or []
+                if not msg_list:
+                    break
+
+                for msg_info in msg_list:
+                    if processed_new >= max_new_messages:
+                        stop = True
+                        break
+
                     msg_id = msg_info.get("id")
                     if not msg_id:
                         continue
@@ -3638,6 +3777,10 @@ def _run_gmail_pipeline(run_id: str, label_id: str, user_id: str) -> None:
                         internal_date_ms = int(internal_date_ms_str) if internal_date_ms_str else 0
                     except Exception:
                         internal_date_ms = 0
+
+                    if last_ts_ms and internal_date_ms <= last_ts_ms:
+                        stop = True
+                        break
 
                     headers_list = full_msg.get("payload", {}).get("headers", []) or []
                     headers = {h.get("name", "").lower(): h.get("value", "") for h in headers_list}
@@ -3655,9 +3798,20 @@ def _run_gmail_pipeline(run_id: str, label_id: str, user_id: str) -> None:
 
                     body_text, body_html = _extract_gmail_body(full_msg.get("payload", {}) or {})
 
-                    # Persist fallback messages to the database as well so the
-                    # label's history is complete.
-                    _persist_gmail_message_from_full(full_msg, client, date_val, body_text, body_html)
+                    # Persist into the GmailMessage table so Gmail data is durable
+                    # across runs and available to the chat/RAG tools.
+                    _persist_gmail_message_from_full(
+                        full_msg,
+                        client,
+                        date_val,
+                        body_text,
+                        body_html,
+                        session=session,
+                        commit=False,
+                    )
+                    pending_commits += 1
+                    if pending_commits % commit_batch_size == 0:
+                        session.commit()
 
                     message_obj = {
                         "id": msg_id,
@@ -3673,12 +3827,94 @@ def _run_gmail_pipeline(run_id: str, label_id: str, user_id: str) -> None:
                         "body_html": body_html,
                     }
                     messages.append(message_obj)
+                    processed_new += 1
 
                     if internal_date_ms > newest_ts_ms:
                         newest_ts_ms = internal_date_ms
 
-            except Exception as e:  # pragma: no cover - defensive logging
-                logger.error(f"Fallback Gmail fetch failed for run {run_id}: {e}", exc_info=True)
+                page_token = result.get("nextPageToken")
+                if not page_token:
+                    break
+
+            # If no new messages were found for this label (common after the
+            # first incremental run), still return the latest messages so the
+            # UI always shows something useful.
+            if not messages:
+                try:
+                    fallback_result = client.list_messages(
+                        max_results=50,
+                        label_ids=[label_id],
+                    )
+                    fallback_list = fallback_result.get("messages", []) or []
+
+                    for msg_info in fallback_list:
+                        msg_id = msg_info.get("id")
+                        if not msg_id:
+                            continue
+
+                        full_msg = client.get_message(msg_id, format="full")
+                        if not full_msg:
+                            continue
+
+                        internal_date_ms_str = full_msg.get("internalDate")
+                        try:
+                            internal_date_ms = int(internal_date_ms_str) if internal_date_ms_str else 0
+                        except Exception:
+                            internal_date_ms = 0
+
+                        headers_list = full_msg.get("payload", {}).get("headers", []) or []
+                        headers = {h.get("name", "").lower(): h.get("value", "") for h in headers_list}
+
+                        from_raw = headers.get("from", "")
+                        to_raw = headers.get("to")
+                        cc_raw = headers.get("cc")
+                        bcc_raw = headers.get("bcc")
+                        subject = headers.get("subject", "")
+                        date_str = headers.get("date")
+                        try:
+                            date_val = parsedate_to_datetime(date_str) if date_str else None
+                        except Exception:
+                            date_val = None
+
+                        body_text, body_html = _extract_gmail_body(full_msg.get("payload", {}) or {})
+
+                        # Persist fallback messages to the database as well so the
+                        # label's history is complete.
+                        _persist_gmail_message_from_full(
+                            full_msg,
+                            client,
+                            date_val,
+                            body_text,
+                            body_html,
+                            session=session,
+                            commit=False,
+                        )
+                        pending_commits += 1
+                        if pending_commits % commit_batch_size == 0:
+                            session.commit()
+
+                        message_obj = {
+                            "id": msg_id,
+                            "thread_id": full_msg.get("threadId"),
+                            "from": from_raw,
+                            "to": to_raw,
+                            "cc": cc_raw,
+                            "bcc": bcc_raw,
+                            "subject": subject,
+                            "date": date_val.isoformat() if date_val else None,
+                            "snippet": full_msg.get("snippet", ""),
+                            "body_text": body_text,
+                            "body_html": body_html,
+                        }
+                        messages.append(message_obj)
+
+                        if internal_date_ms > newest_ts_ms:
+                            newest_ts_ms = internal_date_ms
+
+                except Exception as e:  # pragma: no cover - defensive logging
+                    logger.error(f"Fallback Gmail fetch failed for run {run_id}: {e}", exc_info=True)
+
+            session.commit()
 
         gmail_run_messages[run_id] = messages
         run_info["status"] = "completed"
@@ -3702,20 +3938,21 @@ def _run_gmail_pipeline(run_id: str, label_id: str, user_id: str) -> None:
             label_id,
             len(messages),
         )
-        
-        # Automatically sync embeddings after successful ingestion
-        try:
-            logger.info("Auto-syncing Gmail embeddings for label %s...", label_id)
-            embed_stats = sync_embeddings_after_pipeline(
-                data_source="gmail",
-                source_ids=[label_id],
-                db_manager=db_manager
-            )
-            run_info["embedding_stats"] = embed_stats
-            logger.info("✓ Gmail embeddings synced: %s", embed_stats)
-        except Exception as embed_error:
-            logger.error(f"Embedding sync failed (non-fatal): {embed_error}")
-            run_info["embedding_error"] = str(embed_error)
+
+        if Config.AUTO_SYNC_EMBEDDINGS_AFTER_PIPELINE:
+            # Automatically sync embeddings after successful ingestion
+            try:
+                logger.info("Auto-syncing Gmail embeddings for label %s...", label_id)
+                embed_stats = sync_embeddings_after_pipeline(
+                    data_source="gmail",
+                    source_ids=[label_id],
+                    db_manager=db_manager
+                )
+                run_info["embedding_stats"] = embed_stats
+                logger.info("✓ Gmail embeddings synced: %s", embed_stats)
+            except Exception as embed_error:
+                logger.error(f"Embedding sync failed (non-fatal): {embed_error}")
+                run_info["embedding_error"] = str(embed_error)
 
     except Exception as e:  # pragma: no cover - defensive logging
         logger.error(f"Gmail pipeline run {run_id} failed: {e}", exc_info=True)
@@ -4476,22 +4713,23 @@ def _run_notion_pipeline(run_id: str) -> None:
         )
 
         logger.info("Notion pipeline run %s completed with %s pages", run_id, len(pages))
-        
-        # Automatically sync embeddings after successful ingestion
-        try:
-            logger.info("Auto-syncing Notion embeddings for workspace %s...", workspace_id)
-            embed_stats = sync_embeddings_after_pipeline(
-                data_source="notion",
-                source_ids=[workspace_id],
-                db_manager=db_manager
-            )
-            run_stats["embedding_stats"] = embed_stats
-            _update_pipeline_run(run_id, stats=run_stats)
-            logger.info("✓ Notion embeddings synced: %s", embed_stats)
-        except Exception as embed_error:
-            logger.error(f"Embedding sync failed (non-fatal): {embed_error}")
-            run_stats["embedding_error"] = str(embed_error)
-            _update_pipeline_run(run_id, stats=run_stats)
+
+        if Config.AUTO_SYNC_EMBEDDINGS_AFTER_PIPELINE:
+            # Automatically sync embeddings after successful ingestion
+            try:
+                logger.info("Auto-syncing Notion embeddings for workspace %s...", workspace_id)
+                embed_stats = sync_embeddings_after_pipeline(
+                    data_source="notion",
+                    source_ids=[workspace_id],
+                    db_manager=db_manager
+                )
+                run_stats["embedding_stats"] = embed_stats
+                _update_pipeline_run(run_id, stats=run_stats)
+                logger.info("✓ Notion embeddings synced: %s", embed_stats)
+            except Exception as embed_error:
+                logger.error(f"Embedding sync failed (non-fatal): {embed_error}")
+                run_stats["embedding_error"] = str(embed_error)
+                _update_pipeline_run(run_id, stats=run_stats)
 
     except Exception as e:  # pragma: no cover - defensive logging
         logger.error(f"Notion pipeline run {run_id} failed: {e}", exc_info=True)

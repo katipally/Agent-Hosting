@@ -29,6 +29,8 @@ class Config:
     SLACK_CLIENT_SECRET = os.getenv("SLACK_CLIENT_SECRET", "")
     SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET", "")
     SLACK_VERIFICATION_TOKEN = os.getenv("SLACK_VERIFICATION_TOKEN", "")
+
+    SLACK_CONVERSATIONS_HISTORY_LIMIT = int(os.getenv("SLACK_CONVERSATIONS_HISTORY_LIMIT", "15"))
     
     # Database
     # Connection string must be provided via environment (see .env.example)
@@ -122,6 +124,10 @@ class Config:
     # Performance
     BATCH_SIZE = 100
     WORKER_THREADS = 4
+
+    AUTO_SYNC_EMBEDDINGS_AFTER_PIPELINE = (
+        os.getenv("AUTO_SYNC_EMBEDDINGS_AFTER_PIPELINE", "false").lower() == "true"
+    )
     
     @classmethod
     def create_directories(cls):
