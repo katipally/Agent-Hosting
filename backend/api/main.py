@@ -55,7 +55,7 @@ import secrets
 from datetime import datetime, timedelta
 from pathlib import Path
 from email.utils import parsedate_to_datetime
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 import time
 import requests
 from sqlalchemy import cast, or_, func
@@ -910,14 +910,41 @@ async def auth_me(request: Request, current_user: AppUser = Depends(get_current_
 
 # CORS middleware for React frontend
 _frontend_origins: list[str] = []
+
+
+def _add_cors_origin(origin: str) -> None:
+    origin = (origin or "").strip().rstrip("/")
+    if not origin:
+        return
+
+    if origin not in _frontend_origins:
+        _frontend_origins.append(origin)
+
+    # Add both www/non-www variants to avoid subtle production mismatches.
+    try:
+        parsed = urlsplit(origin)
+        if not parsed.scheme or not parsed.netloc:
+            return
+
+        host = parsed.netloc
+        if host.startswith("www."):
+            alt_host = host[4:]
+        else:
+            alt_host = f"www.{host}"
+
+        alt_origin = f"{parsed.scheme}://{alt_host}"
+        if alt_origin not in _frontend_origins:
+            _frontend_origins.append(alt_origin)
+    except Exception:
+        return
+
+
 if Config.FRONTEND_BASE_URL:
-    _frontend_origins.append(Config.FRONTEND_BASE_URL)
+    _add_cors_origin(Config.FRONTEND_BASE_URL)
 
 extra_origins = os.getenv("CORS_ALLOWED_ORIGINS", "")
 for origin in extra_origins.split(","):
-    origin = origin.strip()
-    if origin and origin not in _frontend_origins:
-        _frontend_origins.append(origin)
+    _add_cors_origin(origin)
 
 if not _frontend_origins:
     # Fallback to permissive CORS when no origins are configured

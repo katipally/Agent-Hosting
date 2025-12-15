@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { API_BASE_URL } from '../../lib/api'
 import { SearchableSelect } from '../common/SearchableSelect'
+import { Pencil, Trash2 } from 'lucide-react'
 import {
   Dialog,
   DialogContent,
@@ -9,6 +10,16 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 
 interface ProjectSummary {
   id: string
@@ -147,9 +158,66 @@ export default function ProjectsInterface() {
   const [createProjectOpen, setCreateProjectOpen] = useState(false)
   const [createProjectName, setCreateProjectName] = useState('')
 
+  const [renameProjectOpen, setRenameProjectOpen] = useState(false)
+  const [renameProjectId, setRenameProjectId] = useState<string | null>(null)
+  const [renameProjectName, setRenameProjectName] = useState('')
+  const [deleteProjectTargetId, setDeleteProjectTargetId] = useState<string | null>(null)
+
   const flashError = (message: string) => {
     setError(message)
     window.setTimeout(() => setError(null), 6000)
+  }
+
+  const handleStartRenameProject = (project: ProjectSummary) => {
+    setRenameProjectId(project.id)
+    setRenameProjectName(project.name || '')
+    setRenameProjectOpen(true)
+  }
+
+  const handleConfirmRenameProject = async () => {
+    const projectId = renameProjectId
+    const name = renameProjectName.trim()
+    if (!projectId) return
+    if (!name) {
+      flashError('Project name is required')
+      return
+    }
+
+    try {
+      const updated = await fetchJSON<ProjectSummary>(`${API_BASE_URL}/api/projects/${projectId}`, {
+        method: 'PUT',
+        body: JSON.stringify({ name }),
+      })
+
+      setProjects((prev) => prev.map((p) => (p.id === updated.id ? { ...p, ...updated } : p)))
+      setSelectedProject((prev) => (prev && prev.id === updated.id ? { ...prev, name: updated.name } : prev))
+      setRenameProjectOpen(false)
+      setRenameProjectId(null)
+    } catch (e: any) {
+      flashError(e.message || 'Failed to rename project')
+    }
+  }
+
+  const handleDeleteProject = async (projectId: string) => {
+    try {
+      await fetchJSON(`${API_BASE_URL}/api/projects/${projectId}`, { method: 'DELETE' })
+      setProjects((prev) => {
+        const next = prev.filter((p) => p.id !== projectId)
+        if (selectedProjectId === projectId) {
+          setSelectedProjectId(next.length > 0 ? next[0].id : null)
+          setSelectedProject(null)
+          setChatMessages([])
+        }
+        return next
+      })
+      setSyncState((prev) => {
+        const next = { ...prev }
+        delete next[projectId]
+        return next
+      })
+    } catch (e: any) {
+      flashError(e.message || 'Failed to delete project')
+    }
   }
 
   const pollProjectSyncRun = async (runId: string) => {
@@ -582,6 +650,34 @@ export default function ProjectsInterface() {
 
   return (
     <div className="flex h-full bg-background">
+      <AlertDialog
+        open={deleteProjectTargetId !== null}
+        onOpenChange={(open: boolean) => !open && setDeleteProjectTargetId(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete project?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This will permanently delete the project and its linked sources.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel onClick={() => setDeleteProjectTargetId(null)}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-red-600 hover:bg-red-700"
+              onClick={async () => {
+                if (!deleteProjectTargetId) return
+                const id = deleteProjectTargetId
+                setDeleteProjectTargetId(null)
+                await handleDeleteProject(id)
+              }}
+            >
+              Delete
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
       <Dialog open={createProjectOpen} onOpenChange={setCreateProjectOpen}>
         <DialogContent>
           <DialogHeader>
@@ -605,6 +701,41 @@ export default function ProjectsInterface() {
             </Button>
             <Button type="button" onClick={handleConfirmCreateProject}>
               Create
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={renameProjectOpen} onOpenChange={setRenameProjectOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Rename project</DialogTitle>
+          </DialogHeader>
+          <div className="grid gap-2">
+            <label className="text-xs font-medium text-muted-foreground" htmlFor="rename-project-name">
+              Project name
+            </label>
+            <input
+              id="rename-project-name"
+              className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary"
+              value={renameProjectName}
+              onChange={(e) => setRenameProjectName(e.target.value)}
+              placeholder="Project name"
+            />
+          </div>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => {
+                setRenameProjectOpen(false)
+                setRenameProjectId(null)
+              }}
+            >
+              Cancel
+            </Button>
+            <Button type="button" onClick={handleConfirmRenameProject}>
+              Save
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -636,16 +767,44 @@ export default function ProjectsInterface() {
                   <button
                     type="button"
                     onClick={() => setSelectedProjectId(p.id)}
-                    className={`w-full text-left px-3 py-2 text-xs border-l-2 transition-colors ${{
+                    className={`group relative w-full text-left px-3 py-2 text-xs border-l-2 transition-colors ${{
                       true: 'border-blue-500 bg-muted/60',
                       false: 'border-transparent hover:bg-muted/40',
                     }[String(selectedProjectId === p.id)]}`}
                   >
                     <div className="flex items-center justify-between gap-2">
                       <span className="font-medium text-foreground truncate">{p.name}</span>
-                      <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-muted text-muted-foreground capitalize">
-                        {p.status || 'not_started'}
-                      </span>
+                      <div className="flex items-center gap-2">
+                        <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-muted text-muted-foreground capitalize">
+                          {p.status || 'not_started'}
+                        </span>
+                        <div className="flex items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100">
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              handleStartRenameProject(p)
+                            }}
+                            className="hover:text-blue-600"
+                            title="Rename project"
+                            aria-label="Rename project"
+                          >
+                            <Pencil className="h-4 w-4" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              setDeleteProjectTargetId(p.id)
+                            }}
+                            className="hover:text-red-600"
+                            title="Delete project"
+                            aria-label="Delete project"
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </button>
+                        </div>
+                      </div>
                     </div>
                     {p.summary && (
                       <p className="mt-0.5 text-[10px] text-muted-foreground line-clamp-2">

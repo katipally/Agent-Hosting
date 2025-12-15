@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { API_BASE_URL } from '../../lib/api'
 import { SearchableSelect } from '../common/SearchableSelect'
+import { Pencil, Trash2 } from 'lucide-react'
 import {
   Dialog,
   DialogContent,
@@ -9,6 +10,16 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 
 interface WorkflowChannel {
   slack_channel_id: string
@@ -81,6 +92,11 @@ export default function WorkflowsInterface() {
   const [createWorkflowName, setCreateWorkflowName] = useState('')
   const [createWorkflowMasterPageId, setCreateWorkflowMasterPageId] = useState('')
 
+  const [renameWorkflowOpen, setRenameWorkflowOpen] = useState(false)
+  const [renameWorkflowId, setRenameWorkflowId] = useState<string | null>(null)
+  const [renameWorkflowName, setRenameWorkflowName] = useState('')
+  const [deleteWorkflowTargetId, setDeleteWorkflowTargetId] = useState<string | null>(null)
+
   const selectedWorkflow =
     workflows.find((w) => w.id === selectedWorkflowId) || (workflows.length > 0 ? workflows[0] : null)
 
@@ -92,6 +108,71 @@ export default function WorkflowsInterface() {
       setSelectedWorkflowId(workflows.length > 0 ? workflows[0].id : null)
     }
   }, [selectedWorkflowId, workflows])
+
+  const handleStartRenameWorkflow = (workflow: Workflow) => {
+    setRenameWorkflowId(workflow.id)
+    setRenameWorkflowName(workflow.name || '')
+    setRenameWorkflowOpen(true)
+  }
+
+  const handleConfirmRenameWorkflow = async () => {
+    const workflowId = renameWorkflowId
+    const name = renameWorkflowName.trim()
+    if (!workflowId) return
+    if (!name) {
+      setError('Workflow name is required')
+      return
+    }
+
+    try {
+      setError(null)
+      setLoading(true)
+      const res = await fetch(`${API_BASE_URL}/api/workflows/${workflowId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ name }),
+      })
+      if (!res.ok) {
+        throw new Error(`Failed to rename workflow: ${res.status}`)
+      }
+      const updated = (await res.json()) as Workflow
+      setWorkflows((prev) => prev.map((w) => (w.id === updated.id ? updated : w)))
+      setRenameWorkflowOpen(false)
+      setRenameWorkflowId(null)
+    } catch (e: any) {
+      console.error('Error renaming workflow', e)
+      setError(e.message || 'Failed to rename workflow')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleDeleteWorkflow = async (workflowId: string) => {
+    try {
+      setError(null)
+      setLoading(true)
+      const res = await fetch(`${API_BASE_URL}/api/workflows/${workflowId}`, {
+        method: 'DELETE',
+        credentials: 'include',
+      })
+      if (!res.ok) {
+        throw new Error(`Failed to delete workflow: ${res.status}`)
+      }
+      setWorkflows((prev) => {
+        const next = prev.filter((w) => w.id !== workflowId)
+        if (selectedWorkflowId === workflowId) {
+          setSelectedWorkflowId(next.length > 0 ? next[0].id : null)
+        }
+        return next
+      })
+    } catch (e: any) {
+      console.error('Error deleting workflow', e)
+      setError(e.message || 'Failed to delete workflow')
+    } finally {
+      setLoading(false)
+    }
+  }
 
   const loadWorkflows = async () => {
     try {
@@ -391,6 +472,34 @@ export default function WorkflowsInterface() {
 
   return (
     <div className="flex h-full bg-background">
+      <AlertDialog
+        open={deleteWorkflowTargetId !== null}
+        onOpenChange={(open: boolean) => !open && setDeleteWorkflowTargetId(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete workflow?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This will permanently delete the workflow and its channel mappings.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel onClick={() => setDeleteWorkflowTargetId(null)}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-red-600 hover:bg-red-700"
+              onClick={async () => {
+                if (!deleteWorkflowTargetId) return
+                const id = deleteWorkflowTargetId
+                setDeleteWorkflowTargetId(null)
+                await handleDeleteWorkflow(id)
+              }}
+            >
+              Delete
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
       <Dialog open={createWorkflowOpen} onOpenChange={setCreateWorkflowOpen}>
         <DialogContent>
           <DialogHeader>
@@ -433,6 +542,41 @@ export default function WorkflowsInterface() {
         </DialogContent>
       </Dialog>
 
+      <Dialog open={renameWorkflowOpen} onOpenChange={setRenameWorkflowOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Rename workflow</DialogTitle>
+          </DialogHeader>
+          <div className="grid gap-2">
+            <label className="text-xs font-medium text-muted-foreground" htmlFor="rename-workflow-name">
+              Workflow name
+            </label>
+            <input
+              id="rename-workflow-name"
+              className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary"
+              value={renameWorkflowName}
+              onChange={(e) => setRenameWorkflowName(e.target.value)}
+              placeholder="Workflow name"
+            />
+          </div>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => {
+                setRenameWorkflowOpen(false)
+                setRenameWorkflowId(null)
+              }}
+            >
+              Cancel
+            </Button>
+            <Button type="button" onClick={handleConfirmRenameWorkflow}>
+              Save
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       <aside className="w-64 border-r border-border bg-card flex flex-col">
         <div className="p-3 border-b border-border flex items-center justify-between">
           <h2 className="text-sm font-semibold text-foreground">Workflows</h2>
@@ -458,16 +602,44 @@ export default function WorkflowsInterface() {
                   <button
                     type="button"
                     onClick={() => setSelectedWorkflowId(wf.id)}
-                    className={`w-full text-left px-3 py-2 text-xs border-l-2 transition-colors ${{
+                    className={`group relative w-full text-left px-3 py-2 text-xs border-l-2 transition-colors ${{
                       true: 'border-blue-500 bg-muted/60',
                       false: 'border-transparent hover:bg-muted/40',
                     }[String(selectedWorkflow?.id === wf.id)]}`}
                   >
                     <div className="flex items-center justify-between gap-2">
                       <span className="font-medium text-foreground truncate">{wf.name}</span>
-                      <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-muted text-muted-foreground capitalize">
-                        {wf.status || 'active'}
-                      </span>
+                      <div className="flex items-center gap-2">
+                        <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-muted text-muted-foreground capitalize">
+                          {wf.status || 'active'}
+                        </span>
+                        <div className="flex items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100">
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              handleStartRenameWorkflow(wf)
+                            }}
+                            className="hover:text-blue-600"
+                            title="Rename workflow"
+                            aria-label="Rename workflow"
+                          >
+                            <Pencil className="h-4 w-4" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              setDeleteWorkflowTargetId(wf.id)
+                            }}
+                            className="hover:text-red-600"
+                            title="Delete workflow"
+                            aria-label="Delete workflow"
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </button>
+                        </div>
+                      </div>
                     </div>
                     <p className="mt-0.5 text-[10px] text-muted-foreground line-clamp-2">
                       {wf.type === 'slack_to_notion'
