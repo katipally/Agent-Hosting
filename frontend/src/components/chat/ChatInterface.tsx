@@ -136,7 +136,7 @@ export default function ChatInterface() {
     <div className="flex h-full bg-background">
       {/* History sidebar */}
       <aside
-        className={`w-64 border-r border-border bg-gray-900 transition-all ${
+        className={`w-64 border-r border-border bg-secondary transition-all ${
           showHistory ? 'block' : 'hidden lg:block'
         }`}
       >

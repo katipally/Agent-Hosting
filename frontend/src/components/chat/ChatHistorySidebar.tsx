@@ -77,7 +77,7 @@ export default function ChatHistorySidebar() {
   }
 
   return (
-    <div className="flex h-full flex-col bg-gray-900 text-white">
+    <div className="flex h-full flex-col bg-secondary text-foreground">
       <AlertDialog
         open={deleteTargetId !== null}
         onOpenChange={(open: boolean) => !open && setDeleteTargetId(null)}
@@ -107,7 +107,7 @@ export default function ChatHistorySidebar() {
       </AlertDialog>
 
       {/* Header */}
-      <div className="border-b border-gray-800 p-4">
+      <div className="border-b border-border p-4">
         <button
           onClick={handleNewChat}
           className="flex w-full items-center justify-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium hover:bg-blue-700 transition-colors"
@@ -121,10 +121,10 @@ export default function ChatHistorySidebar() {
       <div className="flex-1 overflow-y-auto p-2">
         {loading ? (
           <div className="flex items-center justify-center py-8">
-            <Loader2 className="h-6 w-6 animate-spin text-gray-400" />
+            <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
           </div>
         ) : sessions.length === 0 ? (
-          <div className="px-4 py-8 text-center text-sm text-gray-400">
+          <div className="px-4 py-8 text-center text-sm text-muted-foreground">
             No conversations yet
           </div>
         ) : (
@@ -135,8 +135,8 @@ export default function ChatHistorySidebar() {
                 onClick={() => handleSelectSession(session.session_id)}
                 className={`group relative flex w-full items-start gap-3 rounded-lg px-3 py-2.5 text-left transition-colors ${
                   session.session_id === currentSessionId
-                    ? 'bg-gray-800 text-white'
-                    : 'text-gray-300 hover:bg-gray-800/50'
+                    ? 'bg-accent text-accent-foreground'
+                    : 'text-muted-foreground hover:bg-accent/50 hover:text-foreground'
                 }`}
               >
                 <MessageSquare className="mt-0.5 h-4 w-4 flex-shrink-0" />
@@ -144,7 +144,7 @@ export default function ChatHistorySidebar() {
                   <div className="truncate text-sm font-medium">
                     {session.title || 'New Chat'}
                   </div>
-                  <div className="truncate text-xs text-gray-500">
+                  <div className="truncate text-xs text-muted-foreground">
                     {new Date(session.updated_at).toLocaleDateString()}
                   </div>
                 </div>

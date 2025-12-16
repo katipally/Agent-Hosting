@@ -6,7 +6,11 @@ import WorkflowsInterface from './components/workflows/WorkflowsInterfaceV2'
 import SignInView from './components/auth/SignInView'
 import ProfileInterface from './components/auth/ProfileInterface'
 import CalendarInterface from './components/calendar/CalendarInterface'
+import CommandMenu from './components/common/CommandMenu'
+import ThemeToggle from './components/common/ThemeToggle'
 import { useAuthStore } from './store/authStore'
+import { useThemeStore } from './store/themeStore'
+import { Search } from 'lucide-react'
 
 function App() {
   type Tab = 'chat' | 'pipelines' | 'projects' | 'workflows' | 'calendar' | 'profile'
@@ -28,6 +32,19 @@ function App() {
   })
 
   const { user, loading, fetchMe } = useAuthStore()
+  const { theme } = useThemeStore()
+
+  // Initialize theme on mount
+  useEffect(() => {
+    const root = document.documentElement
+    const getSystemTheme = () => window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+    const effectiveTheme = theme === 'system' ? getSystemTheme() : theme
+    if (effectiveTheme === 'dark') {
+      root.classList.add('dark')
+    } else {
+      root.classList.remove('dark')
+    }
+  }, [theme])
 
   // Track which tabs have been mounted (once mounted, stay mounted)
   const [mountedTabs, setMountedTabs] = useState<Set<Tab>>(() => new Set([activeTab]))
@@ -91,6 +108,8 @@ function App() {
 
   return (
     <div className="h-screen w-full flex flex-col bg-background">
+      <CommandMenu onNavigate={setActiveTab} activeTab={activeTab} />
+
       <header className="border-b border-border bg-card px-4 py-2 flex items-center justify-between">
         <div className="flex items-center gap-2">
           <span className="text-sm font-semibold text-foreground">Workforce AI Agent</span>
@@ -163,6 +182,29 @@ function App() {
           >
             Profile
           </button>
+
+          {/* Divider */}
+          <div className="h-4 w-px bg-border mx-1" />
+
+          {/* Search button */}
+          <button
+            type="button"
+            onClick={() => {
+              const event = new KeyboardEvent('keydown', { key: 'k', metaKey: true })
+              document.dispatchEvent(event)
+            }}
+            className="flex items-center gap-2 rounded-md px-2 py-1 text-xs border border-border bg-background text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
+            title="Search (⌘K)"
+          >
+            <Search className="h-3.5 w-3.5" />
+            <span className="hidden sm:inline">Search</span>
+            <kbd className="hidden sm:inline-flex h-5 items-center gap-0.5 rounded border border-border bg-muted px-1.5 font-mono text-[10px] font-medium">
+              ⌘K
+            </kbd>
+          </button>
+
+          {/* Theme toggle */}
+          <ThemeToggle />
         </nav>
       </header>
 

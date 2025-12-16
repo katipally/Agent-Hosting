@@ -267,23 +267,23 @@ export default function CalendarInterface() {
               key={key}
               className={`flex flex-col rounded-md border overflow-hidden min-h-[140px] ${
                 isToday
-                  ? 'border-blue-500 bg-blue-50/70'
+                  ? 'border-blue-500 bg-blue-500/10 dark:bg-blue-500/20'
                   : isSelectedDay
-                    ? 'border-blue-400 bg-blue-50/40'
+                    ? 'border-blue-400 bg-blue-400/10 dark:bg-blue-400/15'
                     : 'border-border bg-card'
               }`}
             >
               <header className="px-2 py-1 border-b border-border flex items-center justify-between">
                 <span
                   className={`text-[11px] font-medium ${
-                    isToday ? 'text-blue-700' : 'text-foreground'
+                    isToday ? 'text-blue-600 dark:text-blue-400' : 'text-foreground'
                   }`}
                 >
                   {day.toLocaleDateString(undefined, { weekday: 'short' })}
                 </span>
                 <span
                   className={`text-[11px] ${
-                    isToday ? 'text-blue-700 font-semibold' : 'text-muted-foreground'
+                    isToday ? 'text-blue-600 dark:text-blue-400 font-semibold' : 'text-muted-foreground'
                   }`}
                 >
                   {day.getDate()}
@@ -346,7 +346,7 @@ export default function CalendarInterface() {
             </div>
           ))}
         </div>
-        <div className="grid grid-cols-7 grid-rows-6 gap-[3px] bg-border/60 text-[11px] rounded-md p-[3px] flex-1">
+        <div className="grid grid-cols-7 grid-rows-6 gap-[3px] bg-border/40 dark:bg-border/60 text-[11px] rounded-md p-[3px] flex-1">
           {days.map((day, idx) => {
             const inMonth = day.getMonth() === month
             const key = getDayKey(day)
@@ -367,9 +367,9 @@ export default function CalendarInterface() {
                   !inMonth
                     ? 'bg-transparent border-none pointer-events-none'
                     : isToday
-                      ? 'border border-blue-500 bg-blue-50/80'
+                      ? 'border border-blue-500 bg-blue-500/10 dark:bg-blue-500/20'
                       : isSelectedDay
-                        ? 'border border-blue-400 bg-blue-50/40'
+                        ? 'border border-blue-400 bg-blue-400/10 dark:bg-blue-400/15'
                         : 'border bg-card border-border'
                 }`}
               >
