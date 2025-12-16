@@ -984,6 +984,27 @@ async def stop_workflow_worker() -> None:
     """Stop the background Slack → Notion workflow scheduler thread."""
     _stop_workflow_worker_internal()
 
+
+@app.on_event("startup")
+async def start_workflow_scheduler_v2() -> None:
+    """Start the modular workflow scheduler (v2) in a background thread."""
+    try:
+        from workflows.workflow_scheduler import reconcile_scheduler_state
+        reconcile_scheduler_state(db_manager)
+    except Exception as e:
+        logger.warning(f"Failed to start workflow scheduler v2: {e}")
+
+
+@app.on_event("shutdown")
+async def stop_workflow_scheduler_v2() -> None:
+    """Stop the modular workflow scheduler (v2) thread."""
+    try:
+        from workflows.workflow_scheduler import stop_workflow_scheduler
+        stop_workflow_scheduler()
+    except Exception as e:
+        logger.warning(f"Failed to stop workflow scheduler v2: {e}")
+
+
 # Request/Response models
 class SourcePreferences(BaseModel):
     slack: bool = True
@@ -3571,6 +3592,348 @@ async def run_workflow_once(workflow_id: str):
     except Exception as e:  # pragma: no cover - defensive logging
         logger.error(f"Error running workflow {workflow_id} once: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to run workflow once")
+
+
+# ============================================================================
+# User Workflows v2 - Modular Source → AI Prompt → Output
+# ============================================================================
+
+
+class UserWorkflowCreateRequest(BaseModel):
+    """Request to create a new user workflow."""
+    name: str
+    description: Optional[str] = None
+    source_config: Optional[Dict[str, Any]] = None
+    prompt_config: Optional[Dict[str, Any]] = None
+    output_config: Optional[Dict[str, Any]] = None
+    schedule_type: str = "manual"
+    schedule_config: Optional[Dict[str, Any]] = None
+
+
+class UserWorkflowUpdateRequest(BaseModel):
+    """Request to update a user workflow."""
+    name: Optional[str] = None
+    description: Optional[str] = None
+    source_config: Optional[Dict[str, Any]] = None
+    prompt_config: Optional[Dict[str, Any]] = None
+    output_config: Optional[Dict[str, Any]] = None
+    schedule_type: Optional[str] = None
+    schedule_config: Optional[Dict[str, Any]] = None
+    status: Optional[str] = None
+
+
+def _serialize_user_workflow(wf) -> Dict[str, Any]:
+    """Serialize a UserWorkflow model to a dict."""
+    return {
+        "id": wf.id,
+        "name": wf.name,
+        "description": wf.description,
+        "source_config": wf.source_config or {},
+        "prompt_config": wf.prompt_config or {},
+        "output_config": wf.output_config or {},
+        "schedule_type": wf.schedule_type,
+        "schedule_config": wf.schedule_config or {},
+        "status": wf.status,
+        "last_run_at": wf.last_run_at.isoformat() if wf.last_run_at else None,
+        "next_run_at": wf.next_run_at.isoformat() if wf.next_run_at else None,
+        "created_at": wf.created_at.isoformat() if wf.created_at else None,
+        "updated_at": wf.updated_at.isoformat() if wf.updated_at else None,
+    }
+
+
+def _serialize_workflow_run(run) -> Dict[str, Any]:
+    """Serialize a WorkflowRun model to a dict."""
+    return {
+        "id": run.id,
+        "workflow_id": run.workflow_id,
+        "status": run.status,
+        "started_at": run.started_at.isoformat() if run.started_at else None,
+        "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+        "source_items_count": run.source_items_count,
+        "source_data_preview": run.source_data_preview,
+        "ai_response": run.ai_response,
+        "output_result": run.output_result,
+        "error_message": run.error_message,
+        "current_step": run.current_step,
+        "progress_percent": run.progress_percent,
+        "logs": run.logs or [],
+        "created_at": run.created_at.isoformat() if run.created_at else None,
+    }
+
+
+@app.get("/api/v2/workflows")
+async def list_user_workflows(user: AppUser = Depends(get_current_user)):
+    """List all workflows for the current user."""
+    try:
+        workflows = db_manager.list_user_workflows(user.id)
+        return {"workflows": [_serialize_user_workflow(wf) for wf in workflows]}
+    except Exception as e:
+        logger.error(f"Error listing user workflows: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to list workflows")
+
+
+@app.post("/api/v2/workflows")
+async def create_user_workflow(
+    req: UserWorkflowCreateRequest,
+    user: AppUser = Depends(get_current_user)
+):
+    """Create a new user workflow."""
+    try:
+        workflow = db_manager.create_user_workflow(
+            owner_user_id=user.id,
+            name=req.name,
+            description=req.description,
+            source_config=req.source_config,
+            prompt_config=req.prompt_config,
+            output_config=req.output_config,
+            schedule_type=req.schedule_type,
+            schedule_config=req.schedule_config,
+        )
+        return _serialize_user_workflow(workflow)
+    except Exception as e:
+        logger.error(f"Error creating user workflow: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to create workflow")
+
+
+@app.get("/api/v2/workflows/{workflow_id}")
+async def get_user_workflow(
+    workflow_id: str,
+    user: AppUser = Depends(get_current_user)
+):
+    """Get a specific workflow by ID."""
+    try:
+        workflow = db_manager.get_user_workflow(workflow_id, user.id)
+        if not workflow:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+        return _serialize_user_workflow(workflow)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting user workflow {workflow_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to get workflow")
+
+
+@app.put("/api/v2/workflows/{workflow_id}")
+async def update_user_workflow(
+    workflow_id: str,
+    req: UserWorkflowUpdateRequest,
+    user: AppUser = Depends(get_current_user)
+):
+    """Update a workflow's configuration."""
+    try:
+        updates = {k: v for k, v in req.model_dump().items() if v is not None}
+        workflow = db_manager.update_user_workflow(workflow_id, user.id, **updates)
+        if not workflow:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+        return _serialize_user_workflow(workflow)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating user workflow {workflow_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to update workflow")
+
+
+@app.delete("/api/v2/workflows/{workflow_id}")
+async def delete_user_workflow(
+    workflow_id: str,
+    user: AppUser = Depends(get_current_user)
+):
+    """Delete a workflow and all its runs."""
+    try:
+        deleted = db_manager.delete_user_workflow(workflow_id, user.id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+        return {"status": "ok"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting user workflow {workflow_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to delete workflow")
+
+
+@app.post("/api/v2/workflows/{workflow_id}/run")
+async def run_user_workflow(
+    workflow_id: str,
+    user: AppUser = Depends(get_current_user)
+):
+    """Trigger a manual run of a workflow."""
+    try:
+        workflow = db_manager.get_user_workflow(workflow_id, user.id)
+        if not workflow:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+
+        # Import and run the workflow engine
+        from workflows.workflow_engine import WorkflowExecutionEngine
+        engine = WorkflowExecutionEngine(db_manager, user.id)
+        
+        # Run in background thread to avoid blocking
+        result = await _run_in_executor(
+            lambda: asyncio.run(engine.execute_workflow(workflow_id))
+        )
+        
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error running user workflow {workflow_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to run workflow")
+
+
+@app.get("/api/v2/workflows/{workflow_id}/runs")
+async def list_workflow_runs(
+    workflow_id: str,
+    limit: int = 20,
+    user: AppUser = Depends(get_current_user)
+):
+    """List runs for a workflow."""
+    try:
+        workflow = db_manager.get_user_workflow(workflow_id, user.id)
+        if not workflow:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+
+        runs = db_manager.list_workflow_runs(workflow_id, limit)
+        return {"runs": [_serialize_workflow_run(r) for r in runs]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error listing runs for workflow {workflow_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to list workflow runs")
+
+
+@app.get("/api/v2/workflows/{workflow_id}/runs/{run_id}")
+async def get_workflow_run(
+    workflow_id: str,
+    run_id: str,
+    user: AppUser = Depends(get_current_user)
+):
+    """Get details of a specific workflow run."""
+    try:
+        workflow = db_manager.get_user_workflow(workflow_id, user.id)
+        if not workflow:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+
+        run = db_manager.get_workflow_run(run_id)
+        if not run or run.workflow_id != workflow_id:
+            raise HTTPException(status_code=404, detail="Run not found")
+
+        return _serialize_workflow_run(run)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting run {run_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to get workflow run")
+
+
+@app.post("/api/v2/workflows/{workflow_id}/runs/{run_id}/cancel")
+async def cancel_workflow_run(
+    workflow_id: str,
+    run_id: str,
+    user: AppUser = Depends(get_current_user)
+):
+    """Cancel a running workflow."""
+    try:
+        workflow = db_manager.get_user_workflow(workflow_id, user.id)
+        if not workflow:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+
+        run = db_manager.get_workflow_run(run_id)
+        if not run or run.workflow_id != workflow_id:
+            raise HTTPException(status_code=404, detail="Run not found")
+
+        if run.status != "running":
+            raise HTTPException(status_code=400, detail="Run is not currently running")
+
+        # Mark the run as cancelled
+        db_manager.update_workflow_run(
+            run_id,
+            status="cancelled",
+            completed_at=datetime.utcnow(),
+            current_step="cancelled",
+            error_message="Cancelled by user"
+        )
+        db_manager.add_workflow_run_log(run_id, "info", "Workflow cancelled by user")
+
+        return {"success": True, "message": "Workflow cancelled"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error cancelling run {run_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to cancel workflow run")
+
+
+# ============================================================================
+# Workflow Source Helpers (for UI dropdowns)
+# ============================================================================
+
+
+@app.get("/api/v2/workflows/sources/slack/channels")
+async def get_workflow_slack_channels(user: AppUser = Depends(get_current_user)):
+    """Get available Slack channels for workflow source configuration."""
+    try:
+        channels = db_manager.get_all_channels(include_archived=False)
+        return {
+            "channels": [
+                {
+                    "id": ch.channel_id,
+                    "name": ch.name,
+                    "is_private": ch.is_private,
+                    "num_members": ch.num_members,
+                }
+                for ch in channels
+            ]
+        }
+    except Exception as e:
+        logger.error(f"Error getting Slack channels for workflow: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to get Slack channels")
+
+
+@app.get("/api/v2/workflows/sources/gmail/labels")
+async def get_workflow_gmail_labels(user: AppUser = Depends(get_current_user)):
+    """Get available Gmail labels for workflow source configuration."""
+    try:
+        with db_manager.get_session() as session:
+            from database.models import GmailLabel
+            labels = session.query(GmailLabel).all()
+            return {
+                "labels": [
+                    {
+                        "id": label.label_id,
+                        "name": label.name,
+                        "type": label.type,
+                    }
+                    for label in labels
+                ]
+            }
+    except Exception as e:
+        logger.error(f"Error getting Gmail labels for workflow: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to get Gmail labels")
+
+
+@app.get("/api/v2/workflows/sources/notion/pages")
+async def get_workflow_notion_pages(user: AppUser = Depends(get_current_user)):
+    """Get available Notion pages for workflow source configuration."""
+    try:
+        with db_manager.get_session() as session:
+            pages = (
+                session.query(NotionPage)
+                .order_by(NotionPage.last_edited_time.desc())
+                .limit(100)
+                .all()
+            )
+            return {
+                "pages": [
+                    {
+                        "id": page.page_id,
+                        "title": page.title or "Untitled",
+                        "object_type": page.object_type,
+                        "url": page.url,
+                    }
+                    for page in pages
+                ]
+            }
+    except Exception as e:
+        logger.error(f"Error getting Notion pages for workflow: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to get Notion pages")
 
 
 # File upload configuration

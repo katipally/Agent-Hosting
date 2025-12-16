@@ -46,6 +46,8 @@ from .models import (
     AppSettings,
     PipelineRun,
     ProjectSyncCursor,
+    UserWorkflow,
+    WorkflowRun,
 )
 from utils.logger import get_logger
 
@@ -1258,3 +1260,237 @@ class DatabaseManager:
             if mapping:
                 session.delete(mapping)
                 session.commit()
+
+    # ========================================================================
+    # User Workflow Operations (v2 Modular Workflows)
+    # ========================================================================
+
+    def create_user_workflow(
+        self,
+        owner_user_id: str,
+        name: str,
+        description: Optional[str] = None,
+        source_config: Optional[Dict[str, Any]] = None,
+        prompt_config: Optional[Dict[str, Any]] = None,
+        output_config: Optional[Dict[str, Any]] = None,
+        schedule_type: str = "manual",
+        schedule_config: Optional[Dict[str, Any]] = None,
+    ) -> UserWorkflow:
+        """Create a new user workflow."""
+        with self.get_session() as session:
+            workflow = UserWorkflow(
+                owner_user_id=owner_user_id,
+                name=name,
+                description=description,
+                source_config=source_config or {},
+                prompt_config=prompt_config or {},
+                output_config=output_config or {},
+                schedule_type=schedule_type,
+                schedule_config=schedule_config or {},
+                status="draft",
+            )
+            session.add(workflow)
+            session.commit()
+            session.refresh(workflow)
+            return workflow
+
+    def list_user_workflows(
+        self, owner_user_id: str, limit: int = 100
+    ) -> List[UserWorkflow]:
+        """List user workflows ordered by most recently updated."""
+        with self.get_session() as session:
+            return (
+                session.query(UserWorkflow)
+                .filter(UserWorkflow.owner_user_id == owner_user_id)
+                .order_by(UserWorkflow.updated_at.desc())
+                .limit(limit)
+                .all()
+            )
+
+    def get_user_workflow(
+        self, workflow_id: str, owner_user_id: Optional[str] = None
+    ) -> Optional[UserWorkflow]:
+        """Get a user workflow by ID."""
+        with self.get_session() as session:
+            query = session.query(UserWorkflow).filter(UserWorkflow.id == workflow_id)
+            if owner_user_id:
+                query = query.filter(UserWorkflow.owner_user_id == owner_user_id)
+            return query.first()
+
+    def update_user_workflow(
+        self, workflow_id: str, owner_user_id: Optional[str] = None, **fields: Any
+    ) -> Optional[UserWorkflow]:
+        """Update a user workflow's fields."""
+        with self.get_session() as session:
+            query = session.query(UserWorkflow).filter(UserWorkflow.id == workflow_id)
+            if owner_user_id:
+                query = query.filter(UserWorkflow.owner_user_id == owner_user_id)
+            workflow = query.first()
+            if not workflow:
+                return None
+
+            for key, value in fields.items():
+                if hasattr(workflow, key):
+                    setattr(workflow, key, value)
+
+            workflow.updated_at = datetime.utcnow()
+            session.commit()
+            session.refresh(workflow)
+            return workflow
+
+    def delete_user_workflow(
+        self, workflow_id: str, owner_user_id: Optional[str] = None
+    ) -> bool:
+        """Delete a user workflow and all its runs."""
+        with self.get_session() as session:
+            query = session.query(UserWorkflow).filter(UserWorkflow.id == workflow_id)
+            if owner_user_id:
+                query = query.filter(UserWorkflow.owner_user_id == owner_user_id)
+            workflow = query.first()
+            if workflow:
+                session.delete(workflow)
+                session.commit()
+                return True
+            return False
+
+    def get_active_scheduled_workflows(self) -> List[UserWorkflow]:
+        """Get all active workflows that have scheduling enabled."""
+        with self.get_session() as session:
+            return (
+                session.query(UserWorkflow)
+                .filter(
+                    UserWorkflow.status == "active",
+                    UserWorkflow.schedule_type != "manual",
+                )
+                .all()
+            )
+
+    # ========================================================================
+    # Workflow Run Operations
+    # ========================================================================
+
+    def create_workflow_run(self, workflow_id: str) -> WorkflowRun:
+        """Create a new workflow run."""
+        with self.get_session() as session:
+            run = WorkflowRun(
+                workflow_id=workflow_id,
+                status="pending",
+                current_step="initializing",
+                progress_percent=0,
+                logs=[],
+            )
+            session.add(run)
+            session.commit()
+            session.refresh(run)
+            return run
+
+    def get_workflow_run(self, run_id: str) -> Optional[WorkflowRun]:
+        """Get a workflow run by ID."""
+        with self.get_session() as session:
+            return session.query(WorkflowRun).filter(WorkflowRun.id == run_id).first()
+
+    def list_workflow_runs(
+        self, workflow_id: str, limit: int = 20
+    ) -> List[WorkflowRun]:
+        """List runs for a workflow ordered by most recent."""
+        with self.get_session() as session:
+            return (
+                session.query(WorkflowRun)
+                .filter(WorkflowRun.workflow_id == workflow_id)
+                .order_by(WorkflowRun.created_at.desc())
+                .limit(limit)
+                .all()
+            )
+
+    def update_workflow_run(self, run_id: str, **fields: Any) -> Optional[WorkflowRun]:
+        """Update a workflow run's fields."""
+        with self.get_session() as session:
+            run = session.query(WorkflowRun).filter(WorkflowRun.id == run_id).first()
+            if not run:
+                return None
+
+            for key, value in fields.items():
+                if hasattr(run, key):
+                    setattr(run, key, value)
+
+            session.commit()
+            session.refresh(run)
+            return run
+
+    def add_workflow_run_log(
+        self, run_id: str, level: str, message: str
+    ) -> Optional[WorkflowRun]:
+        """Add a log entry to a workflow run."""
+        with self.get_session() as session:
+            run = session.query(WorkflowRun).filter(WorkflowRun.id == run_id).first()
+            if not run:
+                return None
+
+            logs = list(run.logs or [])
+            logs.append({
+                "timestamp": datetime.utcnow().isoformat(),
+                "level": level,
+                "message": message,
+            })
+            run.logs = logs
+            session.commit()
+            session.refresh(run)
+            return run
+
+    # ========================================================================
+    # Source Data Helpers (for workflow source block)
+    # ========================================================================
+
+    def get_slack_messages_for_workflow(
+        self,
+        channel_ids: List[str],
+        since_timestamp: Optional[float] = None,
+        limit: int = 500,
+    ) -> List[Message]:
+        """Get Slack messages from specified channels for workflow processing."""
+        with self.get_session() as session:
+            query = session.query(Message).filter(Message.channel_id.in_(channel_ids))
+            if since_timestamp:
+                query = query.filter(Message.timestamp >= since_timestamp)
+            return (
+                query.order_by(Message.timestamp.desc())
+                .limit(limit)
+                .all()
+            )
+
+    def get_gmail_messages_for_workflow(
+        self,
+        label_ids: Optional[List[str]] = None,
+        since_date: Optional[datetime] = None,
+        limit: int = 500,
+    ) -> List[GmailMessage]:
+        """Get Gmail messages for workflow processing."""
+        with self.get_session() as session:
+            query = session.query(GmailMessage)
+            if since_date:
+                query = query.filter(GmailMessage.date >= since_date)
+            # Filter by labels if specified (labels are stored as JSON array)
+            messages = query.order_by(GmailMessage.date.desc()).limit(limit * 2).all()
+            
+            if label_ids:
+                # Filter in Python since label_ids is JSON
+                filtered = []
+                for msg in messages:
+                    msg_labels = msg.label_ids or []
+                    if any(lid in msg_labels for lid in label_ids):
+                        filtered.append(msg)
+                        if len(filtered) >= limit:
+                            break
+                return filtered
+            return messages[:limit]
+
+    def get_notion_pages_for_workflow(
+        self, page_ids: List[str]
+    ) -> List[NotionPage]:
+        """Get Notion pages for workflow processing."""
+        with self.get_session() as session:
+            return (
+                session.query(NotionPage)
+                .filter(NotionPage.page_id.in_(page_ids))
+                .all()
+            )
