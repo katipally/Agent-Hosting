@@ -52,6 +52,7 @@ interface OutputConfig {
     subject?: string
     mode?: 'append' | 'replace'
     title?: string
+    allow_body_edits?: boolean
     output_prompt?: string  // Additional instructions for how AI should handle this output
   }>
 }
@@ -1111,7 +1112,7 @@ function SourceEditorDialog({
       setPendingGmailAdd({})
       setPendingNotionAdd({})
     }
-  }, [open, config])
+  }, [open])
 
   const addSource = (type: 'slack' | 'gmail' | 'notion') => {
     setSources([...sources, { type, time_range: 'last_24h', channels: [], labels: [], pages: [] }])
@@ -1500,7 +1501,7 @@ function OutputEditorDialog({
     if (open) {
       setOutputs(config.outputs || [])
     }
-  }, [open, config])
+  }, [open])
 
   const addOutput = (type: OutputConfig['outputs'][0]['type']) => {
     setOutputs([...outputs, { type }])
@@ -1584,6 +1585,22 @@ function OutputEditorDialog({
                       <p className="text-[11px] text-muted-foreground">
                         AI will read the target page/database structure and intelligently update it based on your prompt.
                         It can fill empty fields, update existing content, add to databases, or modify subpages as needed.
+                      </p>
+
+                      <div className="flex items-center gap-2 pt-1">
+                        <input
+                          id={`notion-body-edits-${index}`}
+                          type="checkbox"
+                          checked={!!output.allow_body_edits}
+                          onChange={(e) => updateOutput(index, { allow_body_edits: e.target.checked })}
+                          className="h-4 w-4"
+                        />
+                        <label htmlFor={`notion-body-edits-${index}`} className="text-xs">
+                          Enable safe body edits (update toggle/section content without rewriting the whole page)
+                        </label>
+                      </div>
+                      <p className="text-[11px] text-muted-foreground">
+                        When enabled, the agent can update content inside existing dropdown/toggle sections (or create new sections) while preserving other page structure.
                       </p>
                     </div>
                   )}

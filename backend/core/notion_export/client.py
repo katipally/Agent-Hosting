@@ -23,9 +23,67 @@ class NotionClient:
         """
         self.token = token or Config.NOTION_TOKEN
         self.client = None
+        self._database_to_data_source: Dict[str, str] = {}
         
         if self.token:
-            self.client = Client(auth=self.token)
+            self.client = Client(auth=self.token, notion_version=Config.NOTION_VERSION)
+
+    def _headers(self, *, content_type: bool = False) -> Dict[str, str]:
+        headers: Dict[str, str] = {
+            "Authorization": f"Bearer {self.token}",
+            "Notion-Version": Config.NOTION_VERSION,
+        }
+        if content_type:
+            headers["Content-Type"] = "application/json"
+        return headers
+
+    def _resolve_data_source_id(self, database_or_data_source_id: str) -> Optional[str]:
+        import requests
+
+        if not self.token:
+            return None
+
+        key = (database_or_data_source_id or "").strip()
+        if not key:
+            return None
+
+        cached = self._database_to_data_source.get(key)
+        if cached:
+            return cached
+
+        # Prefer treating the ID as a database_id first.
+        try:
+            resp = requests.get(
+                f"https://api.notion.com/v1/databases/{key}",
+                headers=self._headers(),
+                timeout=30,
+            )
+            if resp.status_code == 200:
+                data = resp.json() or {}
+                data_sources = data.get("data_sources") or []
+                if isinstance(data_sources, list) and data_sources:
+                    first = data_sources[0] if isinstance(data_sources[0], dict) else None
+                    ds_id = (first or {}).get("id")
+                    if ds_id:
+                        self._database_to_data_source[key] = ds_id
+                        return ds_id
+                return None
+        except Exception:
+            pass
+
+        # Fall back to treating the ID as a data_source_id.
+        try:
+            resp = requests.get(
+                f"https://api.notion.com/v1/data_sources/{key}",
+                headers=self._headers(),
+                timeout=30,
+            )
+            if resp.status_code == 200:
+                return key
+        except Exception:
+            pass
+
+        return None
     
     def test_connection(self) -> bool:
         """Test Notion API connection.
@@ -408,10 +466,7 @@ class NotionClient:
         if not self.token:
             return None
         
-        headers = {
-            "Authorization": f"Bearer {self.token}",
-            "Notion-Version": "2022-06-28",
-        }
+        headers = self._headers()
         
         try:
             response = requests.get(
@@ -424,11 +479,37 @@ class NotionClient:
                 logger.debug(f"Database {database_id} not found")
                 return None
             
-            if response.status_code != 200:
-                logger.debug(f"Not a database or access error for {database_id}: {response.status_code}")
-                return None
-                
-            return response.json()
+            if response.status_code == 200:
+                db_obj = response.json() or {}
+                ds_id = self._resolve_data_source_id(database_id)
+                if not ds_id:
+                    return db_obj
+
+                ds_resp = requests.get(
+                    f"https://api.notion.com/v1/data_sources/{ds_id}",
+                    headers=headers,
+                    timeout=30,
+                )
+                if ds_resp.status_code != 200:
+                    return db_obj
+
+                ds_obj = ds_resp.json() or {}
+                merged = dict(db_obj)
+                merged["properties"] = ds_obj.get("properties")
+                merged["data_source_id"] = ds_id
+                return merged
+
+            # Not a database_id; try treating as data_source_id
+            ds_resp = requests.get(
+                f"https://api.notion.com/v1/data_sources/{database_id}",
+                headers=headers,
+                timeout=30,
+            )
+            if ds_resp.status_code == 200:
+                return ds_resp.json()
+
+            logger.debug(f"Not a database or access error for {database_id}: {response.status_code}")
+            return None
         except Exception as e:
             logger.error(f"Error retrieving database {database_id}: {e}")
             return None
@@ -459,19 +540,16 @@ class NotionClient:
         results: List[Dict[str, Any]] = []
         cursor: Optional[str] = None
         
-        headers = {
-            "Authorization": f"Bearer {self.token}",
-            "Notion-Version": "2022-06-28",
-            "Content-Type": "application/json",
-        }
+        headers = self._headers(content_type=True)
         
         try:
             while len(results) < max_results:
                 payload: Dict[str, Any] = {"page_size": min(100, max_results - len(results))}
                 if query:
                     payload["query"] = query
-                if filter_type in ("page", "database"):
-                    payload["filter"] = {"value": filter_type, "property": "object"}
+                if filter_type in ("page", "database", "data_source"):
+                    value = "data_source" if filter_type == "database" else filter_type
+                    payload["filter"] = {"value": value, "property": "object"}
                 if cursor:
                     payload["start_cursor"] = cursor
                 
@@ -516,12 +594,8 @@ class NotionClient:
         
         databases: List[Dict[str, Any]] = []
         cursor: Optional[str] = None
-        
-        headers = {
-            "Authorization": f"Bearer {self.token}",
-            "Notion-Version": "2022-06-28",
-            "Content-Type": "application/json",
-        }
+
+        headers = self._headers(content_type=True)
         
         try:
             while True:
@@ -542,7 +616,7 @@ class NotionClient:
                 results = data.get("results", [])
                 
                 for item in results:
-                    if item.get("object") == "database":
+                    if item.get("object") in ("database", "data_source"):
                         if title:
                             db_title_parts = item.get("title", [])
                             db_title = "".join(t.get("plain_text", "") for t in db_title_parts)
@@ -616,12 +690,17 @@ class NotionClient:
 
         results: List[Dict[str, Any]] = []
         cursor: Optional[str] = None
-        
-        headers = {
-            "Authorization": f"Bearer {self.token}",
-            "Notion-Version": "2022-06-28",
-            "Content-Type": "application/json",
-        }
+
+        headers = self._headers(content_type=True)
+
+        data_source_id = self._resolve_data_source_id(database_id)
+        if not data_source_id:
+            logger.warning(
+                "Could not resolve data_source_id for %s; cannot query database in Notion-Version %s",
+                database_id,
+                Config.NOTION_VERSION,
+            )
+            return []
 
         try:
             while len(results) < max_results:
@@ -634,7 +713,7 @@ class NotionClient:
                     payload["start_cursor"] = cursor
 
                 response = requests.post(
-                    f"https://api.notion.com/v1/databases/{database_id}/query",
+                    f"https://api.notion.com/v1/data_sources/{data_source_id}/query",
                     headers=headers,
                     json=payload,
                     timeout=30,
@@ -952,13 +1031,14 @@ class NotionClient:
             return None
 
         try:
+            ds_id = self._resolve_data_source_id(database_id)
+            if not ds_id:
+                logger.error(f"Could not resolve data_source_id for database {database_id}")
+                return None
+
             response = requests.patch(
-                f"https://api.notion.com/v1/databases/{database_id}",
-                headers={
-                    "Authorization": f"Bearer {self.token}",
-                    "Notion-Version": "2022-06-28",
-                    "Content-Type": "application/json",
-                },
+                f"https://api.notion.com/v1/data_sources/{ds_id}",
+                headers=self._headers(content_type=True),
                 json={"properties": properties_updates},
                 timeout=30,
             )
@@ -1000,7 +1080,7 @@ class NotionClient:
                 f"https://api.notion.com/v1/blocks/{block_id}",
                 headers={
                     "Authorization": f"Bearer {self.token}",
-                    "Notion-Version": "2022-06-28",
+                    "Notion-Version": Config.NOTION_VERSION,
                     "Content-Type": "application/json",
                 },
                 json={block_type: block_data},
@@ -1049,7 +1129,7 @@ class NotionClient:
                 f"https://api.notion.com/v1/blocks/{block_id}",
                 headers={
                     "Authorization": f"Bearer {self.token}",
-                    "Notion-Version": "2022-06-28",
+                    "Notion-Version": Config.NOTION_VERSION,
                 },
                 timeout=30,
             )
@@ -1101,7 +1181,7 @@ class NotionClient:
                         f"https://api.notion.com/v1/blocks/{parent_id}/children",
                         headers={
                             "Authorization": f"Bearer {self.token}",
-                            "Notion-Version": "2022-06-28",
+                            "Notion-Version": Config.NOTION_VERSION,
                         },
                         params=params,
                         timeout=30,
@@ -1150,15 +1230,24 @@ class NotionClient:
             return None
 
         try:
+            data_source_id = self._resolve_data_source_id(database_id)
+            if not data_source_id:
+                logger.error(
+                    "Could not resolve data_source_id for %s; cannot create row in Notion-Version %s",
+                    database_id,
+                    Config.NOTION_VERSION,
+                )
+                return None
+
             response = requests.post(
                 "https://api.notion.com/v1/pages",
                 headers={
                     "Authorization": f"Bearer {self.token}",
-                    "Notion-Version": "2022-06-28",
+                    "Notion-Version": Config.NOTION_VERSION,
                     "Content-Type": "application/json",
                 },
                 json={
-                    "parent": {"database_id": database_id},
+                    "parent": {"type": "data_source_id", "data_source_id": data_source_id},
                     "properties": properties,
                 },
                 timeout=30,

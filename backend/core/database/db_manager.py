@@ -1335,17 +1335,18 @@ class DatabaseManager:
             return workflow
 
     def list_user_workflows(
-        self, owner_user_id: str, limit: int = 100
+        self, owner_user_id: Optional[str] = None, limit: int = 100
     ) -> List[UserWorkflow]:
-        """List user workflows ordered by most recently updated."""
+        """List workflows ordered by most recently updated.
+
+        If owner_user_id is provided, results are scoped to that user.
+        If owner_user_id is None, all workflows are returned (workspace-shared).
+        """
         with self.get_session() as session:
-            return (
-                session.query(UserWorkflow)
-                .filter(UserWorkflow.owner_user_id == owner_user_id)
-                .order_by(UserWorkflow.updated_at.desc())
-                .limit(limit)
-                .all()
-            )
+            query = session.query(UserWorkflow)
+            if owner_user_id:
+                query = query.filter(UserWorkflow.owner_user_id == owner_user_id)
+            return query.order_by(UserWorkflow.updated_at.desc()).limit(limit).all()
 
     def get_user_workflow(
         self, workflow_id: str, owner_user_id: Optional[str] = None

@@ -297,6 +297,14 @@ class WorkforceAIBrain:
         
         logger.info(f"✓ AI Brain initialized with model: {model}")
         logger.info(f"Available tools: {len(self.tools)}")
+
+    async def close(self) -> None:
+        try:
+            client = getattr(self, "client", None)
+            if client and hasattr(client, "close"):
+                await client.close()
+        except Exception:
+            return
     
     def _define_tools(self) -> List[Dict[str, Any]]:
         """Define tools in OpenAI function calling format."""
@@ -312,6 +320,46 @@ class WorkforceAIBrain:
                         "required": []
                     }
                 }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "upsert_notion_toggle_section",
+                    "description": "Safely create or update a toggle/dropdown section inside a Notion page by section title. Only edits that section's children and preserves the rest of the page.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "page_id": {
+                                "type": "string",
+                                "description": "Notion page ID to update",
+                            },
+                            "section_title": {
+                                "type": "string",
+                                "description": "Section/toggle title (e.g., 'General Information', 'Use Cases')",
+                            },
+                            "content": {
+                                "type": "string",
+                                "description": "Content to put inside the section (supports basic markdown: paragraphs, bullets, numbered lists)",
+                            },
+                            "replace_children": {
+                                "type": "boolean",
+                                "description": "If true, archive existing children inside the section and replace with new content (default true)",
+                                "default": True,
+                            },
+                            "max_depth": {
+                                "type": "integer",
+                                "description": "Max depth to search for the section (default 3)",
+                                "default": 3,
+                            },
+                            "confirmed": {
+                                "type": "boolean",
+                                "description": "Set true to execute the edit after preview/confirmation.",
+                                "default": False,
+                            },
+                        },
+                        "required": ["page_id", "section_title", "content"],
+                    },
+                },
             },
             {
                 "type": "function",
@@ -530,6 +578,28 @@ class WorkforceAIBrain:
                                 "type": "integer",
                                 "description": "Maximum number of blocks to read (safety cap, default 500)",
                                 "default": 500,
+                            },
+                        },
+                        "required": ["page_id"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_notion_page_outline",
+                    "description": "Get a lightweight outline of a Notion page with toggle/heading sections and their block IDs. Use this before editing dropdown/toggle sections.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "page_id": {
+                                "type": "string",
+                                "description": "Notion page ID to outline",
+                            },
+                            "max_depth": {
+                                "type": "integer",
+                                "description": "Max outline depth (default 2)",
+                                "default": 2,
                             },
                         },
                         "required": ["page_id"],
@@ -1800,6 +1870,12 @@ class WorkforceAIBrain:
                     max_depth=3,
                     max_blocks=arguments.get("max_blocks", 500),
                 )
+
+            elif tool_name == "get_notion_page_outline":
+                result = self.tools_handler.get_notion_page_outline(
+                    page_id=arguments.get("page_id", ""),
+                    max_depth=arguments.get("max_depth", 2),
+                )
             
             elif tool_name == "update_notion_page_content":
                 result = self.tools_handler.update_notion_page_content(
@@ -2084,6 +2160,16 @@ class WorkforceAIBrain:
                     include_blocks=arguments.get("include_blocks", True),
                     include_database_rows=arguments.get("include_database_rows", True),
                     max_depth=arguments.get("max_depth", 3),
+                )
+
+            elif tool_name == "upsert_notion_toggle_section":
+                result = self.tools_handler.upsert_notion_toggle_section(
+                    page_id=arguments.get("page_id", ""),
+                    section_title=arguments.get("section_title", ""),
+                    content=arguments.get("content", ""),
+                    replace_children=bool(arguments.get("replace_children", True)),
+                    max_depth=int(arguments.get("max_depth", 3) or 3),
+                    confirmed=bool(arguments.get("confirmed", False)),
                 )
             
             elif tool_name == "update_notion_database_schema":

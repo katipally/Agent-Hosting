@@ -144,8 +144,9 @@ For Notion destinations:
 5. **Respect field types** - Select fields need valid option values; dates need date format; multi-select needs array format.
 
 ## OUTPUT FORMAT
-Before your FIRST write tool call, include a short **PLAN** in the assistant message (this is for logs/UI only; it is NOT written to destinations).
-After completing all tool calls, return a brief summary of what was updated (for logging purposes only - this is NOT written to destinations).
+Always include a **PLAN** section (at least 3 bullet points) in the assistant message before any tool calls.
+Always include an **Update status:** line (e.g. "Update status: No changes required" or "Update status: Updated Status and Next Step").
+This is for logs/UI only; it is NOT written to destinations.
 """
 
 
@@ -161,6 +162,14 @@ class WorkflowExecutionEngine:
         self.db_manager = db_manager
         self.user_id = user_id
         self.openai_client = AsyncOpenAI(api_key=Config.OPENAI_API_KEY)
+
+    async def close(self) -> None:
+        try:
+            client = getattr(self, "openai_client", None)
+            if client and hasattr(client, "close"):
+                await client.close()
+        except Exception:
+            return
 
     def _check_cancelled(self, run_id: str) -> None:
         """Check if the run has been cancelled and raise exception if so."""
@@ -278,10 +287,14 @@ class WorkflowExecutionEngine:
             elif t == "notion_page":
                 target_page_id = o.get("page_id")
                 is_row_page = bool(target_page_id and notion_row_page_targets and target_page_id in notion_row_page_targets)
+                allow_body_edits = bool(o.get("allow_body_edits"))
 
                 allowed_writes.add("update_notion_entry_by_name")
                 allowed_writes.add("update_notion_database_entry")
                 allowed_writes.add("update_notion_database_entry_properties")
+
+                if allow_body_edits and target_page_id:
+                    allowed_writes.add("upsert_notion_toggle_section")
 
                 if not is_row_page:
                     allowed_writes.add("append_to_notion_page")
@@ -383,6 +396,21 @@ class WorkflowExecutionEngine:
                             "page_id": {"type": "string"},
                             "include_subpages": {"type": "boolean", "default": False},
                             "max_blocks": {"type": "integer", "default": 500},
+                        },
+                        "required": ["page_id"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_notion_page_outline",
+                    "description": "Get a lightweight outline of a Notion page with toggle/heading sections and their block IDs. Use this before editing dropdown/toggle sections.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "page_id": {"type": "string"},
+                            "max_depth": {"type": "integer", "default": 2},
                         },
                         "required": ["page_id"],
                     },
@@ -499,6 +527,24 @@ class WorkflowExecutionEngine:
                         "type": "object",
                         "properties": {"page_id": {"type": "string"}, "content": {"type": "string"}},
                         "required": ["page_id", "content"],
+                    },
+                },
+            },
+            "upsert_notion_toggle_section": {
+                "type": "function",
+                "function": {
+                    "name": "upsert_notion_toggle_section",
+                    "description": "Safely create or update a toggle/dropdown section inside a Notion page by section title. Only edits that section's children and preserves the rest of the page.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "page_id": {"type": "string"},
+                            "section_title": {"type": "string"},
+                            "content": {"type": "string"},
+                            "replace_children": {"type": "boolean", "default": True},
+                            "max_depth": {"type": "integer", "default": 3},
+                        },
+                        "required": ["page_id", "section_title", "content"],
                     },
                 },
             },
@@ -736,6 +782,11 @@ class WorkflowExecutionEngine:
                 include_subpages=bool(arguments.get("include_subpages", False)),
                 max_blocks=int(arguments.get("max_blocks", 500) or 500),
             )
+        if tool_name == "get_notion_page_outline":
+            return tools_handler.get_notion_page_outline(
+                page_id=arguments.get("page_id", ""),
+                max_depth=int(arguments.get("max_depth", 2) or 2),
+            )
         if tool_name == "query_notion_database":
             return tools_handler.query_notion_database(
                 database_id=arguments.get("database_id", ""),
@@ -753,6 +804,15 @@ class WorkflowExecutionEngine:
             return tools_handler.append_to_notion_page(
                 page_id=arguments.get("page_id", ""),
                 content=arguments.get("content", ""),
+            )
+        if tool_name == "upsert_notion_toggle_section":
+            return tools_handler.upsert_notion_toggle_section(
+                page_id=arguments.get("page_id", ""),
+                section_title=arguments.get("section_title", ""),
+                content=arguments.get("content", ""),
+                replace_children=bool(arguments.get("replace_children", True)),
+                max_depth=int(arguments.get("max_depth", 3) or 3),
+                workflow_mode=True,
             )
         if tool_name == "replace_notion_page_content":
             return tools_handler.replace_notion_page_content(
@@ -913,7 +973,7 @@ class WorkflowExecutionEngine:
                 import requests
                 headers = {
                     "Authorization": f"Bearer {Config.NOTION_TOKEN}",
-                    "Notion-Version": "2022-06-28",
+                    "Notion-Version": Config.NOTION_VERSION,
                 }
                 for o in output_config.get("outputs", []):
                     if (o.get("type") == "notion_page") and o.get("page_id"):
@@ -926,7 +986,7 @@ class WorkflowExecutionEngine:
                             )
                             if resp.status_code == 200:
                                 parent = (resp.json() or {}).get("parent", {}) or {}
-                                if parent.get("type") == "database_id":
+                                if parent.get("type") in {"database_id", "data_source_id"}:
                                     notion_row_page_targets.add(pid)
                         except Exception:
                             continue
@@ -943,6 +1003,11 @@ class WorkflowExecutionEngine:
             for o in output_config.get("outputs", [])
             if (o.get("type") == "notion_page" and o.get("page_id"))
         }
+        allow_body_edit_targets = {
+            o.get("page_id")
+            for o in output_config.get("outputs", [])
+            if (o.get("type") == "notion_page" and o.get("page_id") and bool(o.get("allow_body_edits")))
+        }
         allow_create_notion_page = any(
             (o.get("type") == "notion_page" and not o.get("page_id"))
             for o in output_config.get("outputs", [])
@@ -952,6 +1017,7 @@ class WorkflowExecutionEngine:
             messages = list(resume_state.get("messages") or [])
             executed_calls = list(resume_state.get("executed_calls") or [])
             iterations = int(resume_state.get("iterations") or 0)
+            plan_candidate = str(resume_state.get("plan_candidate") or "")
         else:
             messages = [
                 {"role": "system", "content": TOOL_CALLING_SYSTEM_PROMPT},
@@ -969,6 +1035,7 @@ class WorkflowExecutionEngine:
 
             executed_calls = []
             iterations = 0
+            plan_candidate = ""
 
         max_iterations = 8
 
@@ -989,11 +1056,15 @@ class WorkflowExecutionEngine:
             tool_calls = getattr(msg, "tool_calls", None) or []
             content = getattr(msg, "content", None) or ""
 
+            if content and not plan_candidate:
+                plan_candidate = content[:4000]
+
             if not tool_calls:
                 return {
                     "final_response": content,
                     "tool_calls": executed_calls,
                     "iterations": iterations,
+                    "plan": plan_candidate,
                 }
 
             assistant_tool_calls: List[Dict[str, Any]] = []
@@ -1020,6 +1091,34 @@ class WorkflowExecutionEngine:
                     args = json.loads(arg_str)
                 except Exception:
                     args = {}
+
+                if name == "upsert_notion_toggle_section":
+                    target_id = args.get("page_id")
+                    if allowed_notion_targets and target_id not in allowed_notion_targets:
+                        result = "❌ Blocked: Notion write target does not match workflow output configuration."
+                        executed_calls.append({"name": name, "arguments": args, "result_preview": result})
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc.get("id"),
+                                "name": name,
+                                "content": result,
+                            }
+                        )
+                        continue
+
+                    if target_id and (target_id not in allow_body_edit_targets):
+                        result = "❌ Blocked: Notion body edits are disabled for this workflow output. Enable allow_body_edits to use section updates."
+                        executed_calls.append({"name": name, "arguments": args, "result_preview": result})
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc.get("id"),
+                                "name": name,
+                                "content": result,
+                            }
+                        )
+                        continue
 
                 if name in {"append_to_notion_page", "replace_notion_page_content"}:
                     target_id = args.get("page_id")
@@ -1113,7 +1212,7 @@ class WorkflowExecutionEngine:
                             import requests
                             headers = {
                                 "Authorization": f"Bearer {Config.NOTION_TOKEN}",
-                                "Notion-Version": "2022-06-28",
+                                "Notion-Version": Config.NOTION_VERSION,
                             }
                             resp = requests.get(
                                 f"https://api.notion.com/v1/pages/{entry_id}",
@@ -1122,7 +1221,7 @@ class WorkflowExecutionEngine:
                             )
                             if resp.status_code == 200:
                                 parent = (resp.json() or {}).get("parent", {}) or {}
-                                if parent.get("type") == "database_id" and parent.get("database_id") in allowed_notion_targets:
+                                if parent.get("type") in {"database_id", "data_source_id"} and parent.get("database_id") in allowed_notion_targets:
                                     allowed = True
                         except Exception:
                             pass
@@ -1189,6 +1288,7 @@ class WorkflowExecutionEngine:
                         "messages": messages[-30:],
                         "executed_calls": executed_calls,
                         "iterations": iterations,
+                        "plan_candidate": plan_candidate,
                     }
                     self._update_run(
                         run_id,
@@ -1204,6 +1304,7 @@ class WorkflowExecutionEngine:
                         "tool_calls": executed_calls,
                         "iterations": iterations,
                         "pending_user_input": pending,
+                        "plan": plan_candidate,
                     }
 
                 executed_calls.append({"name": name, "arguments": args, "result_preview": str(result)[:500]})
@@ -1221,83 +1322,92 @@ class WorkflowExecutionEngine:
             "final_response": "Reached tool-iteration limit; partial execution may have occurred.",
             "tool_calls": executed_calls,
             "iterations": iterations,
+            "plan": plan_candidate,
         }
 
     async def resume_workflow_run(self, workflow_id: str, run_id: str, selection: str) -> Dict[str, Any]:
         """Resume a paused workflow run after user selects a disambiguation option."""
-        workflow = self.db_manager.get_user_workflow(workflow_id, self.user_id)
-        if not workflow:
-            return {"error": "Workflow not found", "status": "failed"}
-
-        run = self.db_manager.get_workflow_run(run_id)
-        if not run or run.workflow_id != workflow_id:
-            return {"error": "Run not found", "status": "failed"}
-
-        output_result = run.output_result or {}
-        pending = (output_result.get("pending_user_input") or {}) if isinstance(output_result, dict) else {}
-        agent_state = (output_result.get("agent_state") or {}) if isinstance(output_result, dict) else {}
-
-        tool_name = pending.get("tool_name") or ""
-        tool_call_id = pending.get("tool_call_id")
-        tool_arguments = dict(pending.get("tool_arguments") or {})
-        conflict = pending.get("conflict") or {}
-
-        patch_key = conflict.get("patch_key")
-        if patch_key:
-            tool_arguments[patch_key] = selection
-
-        # Clear pending state and mark as running.
-        self._update_run(
-            run_id,
-            status="running",
-            current_step="processing_ai",
-            progress_percent=65,
-            error_message=None,
-            output_result={"pending_user_input": None, "agent_state": agent_state},
-        )
-
-        from agent.langchain_tools import WorkforceTools
-
-        tools_handler = WorkforceTools(user_id=self.user_id)
-        gmail_account_email = None
         try:
-            gmail_account_email = getattr(getattr(tools_handler, "gmail_client", None), "user_email", None)
-        except Exception:
+            workflow = self.db_manager.get_user_workflow(workflow_id, self.user_id)
+            if not workflow:
+                return {"error": "Workflow not found", "status": "failed"}
+
+            run = self.db_manager.get_workflow_run(run_id)
+            if not run or run.workflow_id != workflow_id:
+                return {"error": "Run not found", "status": "failed"}
+
+            output_result = run.output_result or {}
+            pending = (output_result.get("pending_user_input") or {}) if isinstance(output_result, dict) else {}
+            agent_state = (output_result.get("agent_state") or {}) if isinstance(output_result, dict) else {}
+
+            tool_name = pending.get("tool_name") or ""
+            tool_call_id = pending.get("tool_call_id")
+            tool_arguments = dict(pending.get("tool_arguments") or {})
+            conflict = pending.get("conflict") or {}
+
+            patch_key = conflict.get("patch_key")
+            if patch_key:
+                tool_arguments[patch_key] = selection
+
+            # Clear pending state and mark as running.
+            self._update_run(
+                run_id,
+                status="running",
+                current_step="processing_ai",
+                progress_percent=65,
+                error_message=None,
+                output_result={"pending_user_input": None, "agent_state": agent_state},
+            )
+
+            from agent.langchain_tools import WorkforceTools
+
+            tools_handler = WorkforceTools(user_id=self.user_id)
             gmail_account_email = None
+            try:
+                gmail_account_email = getattr(getattr(tools_handler, "gmail_client", None), "user_email", None)
+            except Exception:
+                gmail_account_email = None
 
-        # Re-hydrate messages and inject the resolved tool result.
-        messages = list(agent_state.get("messages") or [])
-        executed_calls = list(agent_state.get("executed_calls") or [])
-        iterations = int(agent_state.get("iterations") or 0)
+            # Re-hydrate messages and inject the resolved tool result.
+            messages = list(agent_state.get("messages") or [])
+            executed_calls = list(agent_state.get("executed_calls") or [])
+            iterations = int(agent_state.get("iterations") or 0)
 
-        # Execute the resolved tool call deterministically.
-        resolved_result = self._execute_workflow_tool(
-            tools_handler,
-            tool_name,
-            tool_arguments,
-            run_id,
-            gmail_account_email,
-        )
-        executed_calls.append({"name": tool_name, "arguments": tool_arguments, "result_preview": str(resolved_result)[:500]})
-        messages.append(
-            {
-                "role": "tool",
-                "tool_call_id": tool_call_id or "call_resumed",
-                "name": tool_name,
-                "content": str(resolved_result),
-            }
-        )
+            # Execute the resolved tool call deterministically.
+            resolved_result = self._execute_workflow_tool(
+                tools_handler,
+                tool_name,
+                tool_arguments,
+                run_id,
+                gmail_account_email,
+            )
+            executed_calls.append({"name": tool_name, "arguments": tool_arguments, "result_preview": str(resolved_result)[:500]})
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call_id or "call_resumed",
+                    "name": tool_name,
+                    "content": str(resolved_result),
+                }
+            )
 
-        # Continue the tool-calling loop.
-        resumed = await self._run_tool_calling_agent(
-            source_data="",
-            destination_state="",
-            prompt_config=workflow.prompt_config,
-            output_config=workflow.output_config,
-            run_id=run_id,
-            resume_state={"messages": messages, "executed_calls": executed_calls, "iterations": iterations},
-        )
-        return resumed
+            # Continue the tool-calling loop.
+            resumed = await self._run_tool_calling_agent(
+                source_data="",
+                destination_state="",
+                prompt_config=workflow.prompt_config,
+                output_config=workflow.output_config,
+                run_id=run_id,
+                resume_state={
+                    "messages": messages,
+                    "executed_calls": executed_calls,
+                    "iterations": iterations,
+                    "plan_candidate": agent_state.get("plan_candidate") or "",
+                },
+            )
+            return resumed
+        finally:
+            await self.close()
 
     async def execute_workflow(self, workflow_id: str, run_id: Optional[str] = None) -> Dict[str, Any]:
         """Execute a complete workflow run.
@@ -1393,12 +1503,14 @@ class WorkflowExecutionEngine:
                     }
                 final_response = agent_result.get("final_response") or ""
                 executed_tool_calls = agent_result.get("tool_calls") or []
+                agent_plan = agent_result.get("plan") or ""
             except Exception as e:
                 # Fall back to legacy JSON-action agent if tool calling fails
                 self._log(run_id, "error", f"Tool-calling agent failed, falling back to legacy mode: {e}")
                 final_response = await self._process_with_ai_intelligent(
                     source_data, destination_state, workflow.prompt_config, workflow.output_config, run_id
                 )
+                agent_plan = ""
 
             self._update_run(
                 run_id,
@@ -1406,6 +1518,55 @@ class WorkflowExecutionEngine:
                 progress_percent=65,
             )
             self._log(run_id, "info", "AI processing complete")
+
+            def _ai_indicates_no_action(text: str) -> bool:
+                t = (text or "").strip().lower()
+                if not t:
+                    return False
+                triggers = [
+                    "no changes required",
+                    "no change required",
+                    "no updates required",
+                    "no update required",
+                    "no changes needed",
+                    "no update needed",
+                    "no updates needed",
+                    "no action required",
+                    "nothing to update",
+                    "already up to date",
+                ]
+                return any(x in t for x in triggers)
+
+            def _extract_plan(text: str) -> str:
+                if not text:
+                    return ""
+                lines = text.splitlines()
+                plan_lines: List[str] = []
+                in_plan = False
+                for line in lines:
+                    s = (line or "").strip()
+                    lower = s.lower()
+                    if not in_plan:
+                        if lower in {"plan", "## plan", "### plan"}:
+                            in_plan = True
+                        continue
+
+                    if not s and plan_lines:
+                        break
+                    if lower.startswith("update status") or lower.startswith("output result"):
+                        break
+                    plan_lines.append(line)
+                    if len(plan_lines) >= 50:
+                        break
+                return "\n".join(plan_lines).strip()
+
+            def _extract_update_status(text: str) -> str:
+                if not text:
+                    return ""
+                for line in text.splitlines():
+                    if "update status" in (line or "").lower():
+                        return (line or "").strip()
+                return ""
 
             # 4. Ensure outputs are satisfied (fallback per destination)
             self._check_cancelled(run_id)
@@ -1438,46 +1599,108 @@ class WorkflowExecutionEngine:
                     }
                 )
 
-            missing_outputs: List[Dict[str, Any]] = []
-            for o in non_display_outputs:
-                ot = o.get("type")
-                if ot == "slack_message" and "send_slack_message" not in executed_write_tools:
-                    missing_outputs.append(o)
-                elif ot == "gmail_draft" and "create_gmail_draft" not in executed_write_tools:
-                    missing_outputs.append(o)
-                elif ot == "notion_page" and not (
-                    {
-                        "create_notion_page",
-                        "append_to_notion_page",
-                        "replace_notion_page_content",
-                        "update_notion_entry_by_name",
-                        "update_notion_database_entry",
-                        "update_notion_database_entry_properties",
-                        "update_notion_database_row_content",
-                    }
-                    & executed_write_tools
-                ):
-                    missing_outputs.append(o)
+            text_for_extraction = (agent_plan or final_response or "")
 
-            if missing_outputs:
-                self._log(run_id, "info", f"Falling back to deterministic outputs for {len(missing_outputs)} destination(s)")
-                fallback_result = await self._execute_outputs(
-                    final_response,
-                    {"outputs": missing_outputs},
-                    run_id,
-                )
-                results.extend(fallback_result.get("outputs", []))
+            no_action_required = _ai_indicates_no_action(final_response)
+            if (not no_action_required) and (not executed_tool_calls) and agent_plan:
+                no_action_required = _ai_indicates_no_action(agent_plan)
+
+            if no_action_required:
+                for o in non_display_outputs:
+                    ot = o.get("type")
+                    if ot == "slack_message":
+                        results.append(
+                            {
+                                "type": "slack",
+                                "success": True,
+                                "details": {"action": "no_action_required", "result": "✅ No update required"},
+                            }
+                        )
+                    elif ot == "gmail_draft":
+                        results.append(
+                            {
+                                "type": "gmail_draft",
+                                "success": True,
+                                "details": {"action": "no_action_required", "result": "✅ No update required"},
+                            }
+                        )
+                    elif ot == "notion_page":
+                        results.append(
+                            {
+                                "type": "notion",
+                                "success": True,
+                                "details": {
+                                    "page_id": o.get("page_id"),
+                                    "action": "no_action_required",
+                                    "result": "✅ No update required",
+                                },
+                            }
+                        )
+            else:
+                missing_outputs: List[Dict[str, Any]] = []
+                for o in non_display_outputs:
+                    ot = o.get("type")
+                    if ot == "slack_message" and "send_slack_message" not in executed_write_tools:
+                        missing_outputs.append(o)
+                    elif ot == "gmail_draft" and "create_gmail_draft" not in executed_write_tools:
+                        missing_outputs.append(o)
+                    elif ot == "notion_page" and not (
+                        {
+                            "create_notion_page",
+                            "append_to_notion_page",
+                            "replace_notion_page_content",
+                            "update_notion_entry_by_name",
+                            "update_notion_database_entry",
+                            "update_notion_database_entry_properties",
+                            "update_notion_database_row_content",
+                        }
+                        & executed_write_tools
+                    ):
+                        missing_outputs.append(o)
+
+                if missing_outputs:
+                    self._log(run_id, "info", f"Falling back to deterministic outputs for {len(missing_outputs)} destination(s)")
+                    fallback_result = await self._execute_outputs(
+                        final_response,
+                        {"outputs": missing_outputs},
+                        run_id,
+                    )
+                    results.extend(fallback_result.get("outputs", []))
 
             output_results["outputs"] = results
             output_results["success"] = all(r.get("success") for r in results) if results else True
             output_results["agent_tool_calls"] = executed_tool_calls
-            output_results["ai_thinking"] = ""
-            output_results["ai_actions_taken"] = "\n".join(
-                [
-                    f"{c.get('name')}: {json.dumps(c.get('arguments', {}), ensure_ascii=False)}"
-                    for c in executed_tool_calls
+
+            plan_text = _extract_plan(text_for_extraction)
+            if plan_text:
+                output_results["ai_thinking"] = plan_text[:2000]
+            else:
+                output_results["ai_thinking"] = (text_for_extraction or "")[:800]
+
+            if executed_tool_calls:
+                output_results["ai_actions_taken"] = "\n".join(
+                    [
+                        f"{c.get('name')}: {json.dumps(c.get('arguments', {}), ensure_ascii=False)}"
+                        for c in executed_tool_calls
+                    ]
+                )
+            else:
+                status_line = _extract_update_status(text_for_extraction)
+                if status_line:
+                    output_results["ai_actions_taken"] = status_line
+                elif no_action_required:
+                    output_results["ai_actions_taken"] = "No external actions executed (no updates required)."
+                else:
+                    output_results["ai_actions_taken"] = "No tool calls were executed."
+
+            if (not executed_tool_calls) and no_action_required:
+                output_results["agent_tool_calls"] = [
+                    {
+                        "name": "no_action_required",
+                        "arguments": {},
+                        "result_preview": "✅ No update required",
+                    }
                 ]
-            )
 
             # If legacy mode produced an ACTIONS JSON response, execute it as a last resort
             if (not results) and final_response:
@@ -1500,7 +1723,11 @@ class WorkflowExecutionEngine:
                 progress_percent=100,
                 output_result=output_results
             )
-            self._log(run_id, "info", "Workflow completed successfully")
+
+            if output_results.get("success") is False:
+                self._log(run_id, "warning", "Workflow completed with output errors")
+            else:
+                self._log(run_id, "info", "Workflow completed successfully")
 
             # Update workflow last_run_at
             self.db_manager.update_user_workflow(
@@ -1530,6 +1757,9 @@ class WorkflowExecutionEngine:
                 error_message=str(e)
             )
             return {"run_id": run_id, "status": "failed", "error": str(e)}
+
+        finally:
+            await self.close()
 
     async def _fetch_sources(
         self, source_config: Dict[str, Any], run_id: str
@@ -1799,7 +2029,13 @@ class WorkflowExecutionEngine:
                     if page_id:
                         # Fetch page content and structure
                         state = self._fetch_notion_page_state(tools, page_id)
-                        destination_parts.append(f"## Notion Destination (page_id: {page_id})\n{state}")
+                        if bool(output.get("allow_body_edits")):
+                            outline = tools.get_notion_page_outline(page_id=page_id, max_depth=2)
+                            destination_parts.append(
+                                f"## Notion Destination (page_id: {page_id})\n{state}\n\n## Notion Page Outline (safe body edits enabled)\n{outline}"
+                            )
+                        else:
+                            destination_parts.append(f"## Notion Destination (page_id: {page_id})\n{state}")
                     else:
                         destination_parts.append("## Notion Destination\nNo target page specified. AI will create a new page.")
                         
@@ -1831,7 +2067,7 @@ class WorkflowExecutionEngine:
         
         headers = {
             "Authorization": f"Bearer {Config.NOTION_TOKEN}",
-            "Notion-Version": "2022-06-28",
+            "Notion-Version": Config.NOTION_VERSION,
             "Content-Type": "application/json",
         }
         
@@ -1863,7 +2099,7 @@ class WorkflowExecutionEngine:
                 return self._fetch_notion_database_state(headers, page_id, page_data)
 
             # Database row page: show properties + parent schema (do NOT treat the row ID as a database)
-            if parent.get("type") == "database_id":
+            if parent.get("type") in {"database_id", "data_source_id"}:
                 return self._fetch_notion_database_row_state(headers, page_data)
             
             # It's a regular page - get its content
@@ -1901,7 +2137,9 @@ class WorkflowExecutionEngine:
         state_parts.append("**Type:** Database Row")
 
         parent = page_data.get("parent", {}) or {}
+        parent_type = parent.get("type")
         db_id = parent.get("database_id")
+        data_source_id = parent.get("data_source_id") if parent_type == "data_source_id" else None
         if db_id:
             state_parts.append(f"**Parent Database ID:** {db_id}")
             try:
@@ -1914,13 +2152,28 @@ class WorkflowExecutionEngine:
                     db_data = db_resp.json() or {}
                     db_title = self._extract_notion_title(db_data)
                     state_parts.append(f"**Parent Database Title:** {db_title}")
-                    properties = db_data.get("properties", {}) or {}
-                    if properties:
-                        schema_lines = ["**Schema (Columns):**"]
-                        for prop_name, prop_def in properties.items():
-                            prop_type = (prop_def or {}).get("type", "unknown")
-                            schema_lines.append(f"  - {prop_name} ({prop_type})")
-                        state_parts.append("\n".join(schema_lines))
+
+                    ds_id = data_source_id
+                    if (not ds_id) and isinstance(db_data.get("data_sources"), list) and db_data.get("data_sources"):
+                        first = db_data.get("data_sources")[0]
+                        if isinstance(first, dict):
+                            ds_id = first.get("id")
+
+                    if ds_id:
+                        ds_resp = requests.get(
+                            f"https://api.notion.com/v1/data_sources/{ds_id}",
+                            headers=headers,
+                            timeout=30,
+                        )
+                        if ds_resp.status_code == 200:
+                            ds_data = ds_resp.json() or {}
+                            properties = ds_data.get("properties", {}) or {}
+                            if properties:
+                                schema_lines = ["**Schema (Columns):**"]
+                                for prop_name, prop_def in properties.items():
+                                    prop_type = (prop_def or {}).get("type", "unknown")
+                                    schema_lines.append(f"  - {prop_name} ({prop_type})")
+                                state_parts.append("\n".join(schema_lines))
             except Exception:
                 pass
 
@@ -1999,7 +2252,24 @@ class WorkflowExecutionEngine:
             state_parts.append(f"**Type:** Database")
             
             # Extract schema (properties/columns)
-            properties = db_data.get("properties", {})
+            ds_id = None
+            if isinstance(db_data, dict):
+                data_sources = db_data.get("data_sources")
+                if isinstance(data_sources, list) and data_sources:
+                    first = data_sources[0]
+                    if isinstance(first, dict):
+                        ds_id = first.get("id")
+
+            properties: Dict[str, Any] = {}
+            if ds_id:
+                ds_resp = requests.get(
+                    f"https://api.notion.com/v1/data_sources/{ds_id}",
+                    headers=headers,
+                    timeout=30,
+                )
+                if ds_resp.status_code == 200:
+                    ds_data = ds_resp.json() or {}
+                    properties = ds_data.get("properties", {}) or {}
             if properties:
                 schema_lines = ["**Schema (Columns):**"]
                 for prop_name, prop_def in properties.items():
@@ -2008,14 +2278,16 @@ class WorkflowExecutionEngine:
                 state_parts.append("\n".join(schema_lines))
             
             # Get sample rows
-            query_resp = requests.post(
-                f"https://api.notion.com/v1/databases/{database_id}/query",
-                headers=headers,
-                json={"page_size": 10},
-                timeout=30
-            )
+            query_resp = None
+            if ds_id:
+                query_resp = requests.post(
+                    f"https://api.notion.com/v1/data_sources/{ds_id}/query",
+                    headers=headers,
+                    json={"page_size": 10},
+                    timeout=30,
+                )
             
-            if query_resp.status_code == 200:
+            if query_resp is not None and query_resp.status_code == 200:
                 rows = query_resp.json().get("results", [])
                 if rows:
                     state_parts.append(f"\n**Existing Rows ({len(rows)} shown):**")
@@ -2346,7 +2618,7 @@ Respond with your THINKING, ACTIONS_TAKEN (human-readable), and ACTIONS (JSON) a
         
         headers = {
             "Authorization": f"Bearer {Config.NOTION_TOKEN}",
-            "Notion-Version": "2022-06-28",
+            "Notion-Version": Config.NOTION_VERSION,
             "Content-Type": "application/json",
         }
         
@@ -2367,21 +2639,14 @@ Respond with your THINKING, ACTIONS_TAKEN (human-readable), and ACTIONS (JSON) a
                 notion_properties[key] = {"rich_text": [{"text": {"content": str(value)}}]}
         
         try:
-            resp = requests.post(
-                "https://api.notion.com/v1/pages",
-                headers=headers,
-                json={
-                    "parent": {"database_id": database_id},
-                    "properties": notion_properties
-                },
-                timeout=30
-            )
-            
-            if resp.status_code == 200:
-                page_id = resp.json().get("id", "")
+            from core.notion_export.client import NotionClient
+
+            client = NotionClient(Config.NOTION_TOKEN)
+            created = client.create_database_entry(database_id=database_id, properties=notion_properties)
+            if created and isinstance(created, dict) and created.get("id"):
+                page_id = created.get("id")
                 return f"✅ Added row to database (ID: {page_id[:8]}...)"
-            else:
-                return f"❌ Failed to add row: {resp.status_code} - {resp.text[:200]}"
+            return "❌ Failed to add row. Check that the integration has access and the database/data source ID is correct."
                 
         except Exception as e:
             return f"❌ Error adding row: {e}"
@@ -2395,7 +2660,7 @@ Respond with your THINKING, ACTIONS_TAKEN (human-readable), and ACTIONS (JSON) a
         
         headers = {
             "Authorization": f"Bearer {Config.NOTION_TOKEN}",
-            "Notion-Version": "2022-06-28",
+            "Notion-Version": Config.NOTION_VERSION,
             "Content-Type": "application/json",
         }
         
@@ -2436,7 +2701,7 @@ Respond with your THINKING, ACTIONS_TAKEN (human-readable), and ACTIONS (JSON) a
         
         headers = {
             "Authorization": f"Bearer {Config.NOTION_TOKEN}",
-            "Notion-Version": "2022-06-28",
+            "Notion-Version": Config.NOTION_VERSION,
             "Content-Type": "application/json",
         }
         
@@ -2520,7 +2785,7 @@ Respond with your THINKING, ACTIONS_TAKEN (human-readable), and ACTIONS (JSON) a
         
         headers = {
             "Authorization": f"Bearer {Config.NOTION_TOKEN}",
-            "Notion-Version": "2022-06-28",
+            "Notion-Version": Config.NOTION_VERSION,
             "Content-Type": "application/json",
         }
         
@@ -2702,7 +2967,7 @@ Please provide your response in {output_format} format."""
                 try:
                     headers = {
                         "Authorization": f"Bearer {Config.NOTION_TOKEN}",
-                        "Notion-Version": "2022-06-28",
+                        "Notion-Version": Config.NOTION_VERSION,
                         "Content-Type": "application/json",
                     }
                     db_resp = requests.get(
@@ -2712,6 +2977,14 @@ Please provide your response in {output_format} format."""
                     )
                     if db_resp.status_code == 200:
                         is_database = True
+                    else:
+                        ds_resp = requests.get(
+                            f"https://api.notion.com/v1/data_sources/{page_id}",
+                            headers=headers,
+                            timeout=20,
+                        )
+                        if ds_resp.status_code == 200:
+                            is_database = True
                 except Exception:
                     is_database = False
 
@@ -2720,7 +2993,7 @@ Please provide your response in {output_format} format."""
                 try:
                     headers = {
                         "Authorization": f"Bearer {Config.NOTION_TOKEN}",
-                        "Notion-Version": "2022-06-28",
+                        "Notion-Version": Config.NOTION_VERSION,
                         "Content-Type": "application/json",
                     }
                     page_resp = requests.get(
@@ -2730,7 +3003,7 @@ Please provide your response in {output_format} format."""
                     )
                     if page_resp.status_code == 200:
                         parent = (page_resp.json() or {}).get("parent", {}) or {}
-                        if parent.get("type") == "database_id":
+                        if parent.get("type") in {"database_id", "data_source_id"}:
                             self._log(
                                 run_id,
                                 "warning",

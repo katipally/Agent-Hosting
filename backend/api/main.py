@@ -1494,13 +1494,14 @@ async def chat_message(
     Returns:
         Chat response with answer and sources
     """
+    brain = None
     try:
         brain = await _build_ai_brain_for_user(current_user)
 
         # Collect streaming response into single output
         full_response = ""
         sources = []
-        
+
         prefs_dict = request.source_prefs.dict() if request.source_prefs else None
 
         async for event in brain.stream_query(
@@ -1509,20 +1510,26 @@ async def chat_message(
             user_email=current_user.email,
             source_prefs=prefs_dict,
         ):
-            if event.get('type') == 'token':
-                full_response += event.get('content', '')
-            elif event.get('type') == 'sources':
-                sources = event.get('content', [])
-        
+            if event.get("type") == "token":
+                full_response += event.get("content", "")
+            elif event.get("type") == "sources":
+                sources = event.get("content", [])
+
         return ChatResponse(
             response=full_response,
             sources=sources,
             intent="general"  # AI Brain doesn't expose intent separately
         )
-    
+
     except Exception as e:
         logger.error(f"Error in chat: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        try:
+            if brain and hasattr(brain, "close"):
+                await brain.close()
+        except Exception:
+            pass
 
 
 def _truncate_history(history: List[Dict[str, str]], max_messages: int = 40, max_chars: int = 8000) -> List[Dict[str, str]]:
@@ -1754,8 +1761,13 @@ async def websocket_chat(websocket: WebSocket):
         # Clean shutdown - no error logging for normal disconnects
         logger.debug("WebSocket connection closed")
         try:
+            if brain and hasattr(brain, "close"):
+                await brain.close()
+        except Exception:
+            pass
+        try:
             await websocket.close()
-        except:
+        except Exception:
             pass
 
 
@@ -3663,9 +3675,9 @@ def _serialize_workflow_run(run) -> Dict[str, Any]:
 
 @app.get("/api/v2/workflows")
 async def list_user_workflows(user: AppUser = Depends(get_current_user)):
-    """List all workflows for the current user."""
+    """List all workflows for the workspace (shared)."""
     try:
-        workflows = db_manager.list_user_workflows(user.id)
+        workflows = db_manager.list_user_workflows()
         return {"workflows": [_serialize_user_workflow(wf) for wf in workflows]}
     except Exception as e:
         logger.error(f"Error listing user workflows: {e}", exc_info=True)
@@ -3702,7 +3714,7 @@ async def get_user_workflow(
 ):
     """Get a specific workflow by ID."""
     try:
-        workflow = db_manager.get_user_workflow(workflow_id, user.id)
+        workflow = db_manager.get_user_workflow(workflow_id)
         if not workflow:
             raise HTTPException(status_code=404, detail="Workflow not found")
         return _serialize_user_workflow(workflow)
@@ -3722,7 +3734,7 @@ async def update_user_workflow(
     """Update a workflow's configuration."""
     try:
         updates = {k: v for k, v in req.model_dump().items() if v is not None}
-        workflow = db_manager.update_user_workflow(workflow_id, user.id, **updates)
+        workflow = db_manager.update_user_workflow(workflow_id, None, **updates)
         if not workflow:
             raise HTTPException(status_code=404, detail="Workflow not found")
         return _serialize_user_workflow(workflow)
@@ -3740,7 +3752,7 @@ async def delete_user_workflow(
 ):
     """Delete a workflow and all its runs."""
     try:
-        deleted = db_manager.delete_user_workflow(workflow_id, user.id)
+        deleted = db_manager.delete_user_workflow(workflow_id, None)
         if not deleted:
             raise HTTPException(status_code=404, detail="Workflow not found")
         return {"status": "ok"}
@@ -3758,13 +3770,13 @@ async def run_user_workflow(
 ):
     """Trigger a manual run of a workflow."""
     try:
-        workflow = db_manager.get_user_workflow(workflow_id, user.id)
+        workflow = db_manager.get_user_workflow(workflow_id)
         if not workflow:
             raise HTTPException(status_code=404, detail="Workflow not found")
 
         # Import and run the workflow engine
         from workflows.workflow_engine import WorkflowExecutionEngine
-        engine = WorkflowExecutionEngine(db_manager, user.id)
+        engine = WorkflowExecutionEngine(db_manager, workflow.owner_user_id)
 
         # Create a run record immediately so the UI can poll for status/logs.
         run = db_manager.create_workflow_run(workflow_id)
@@ -3807,7 +3819,7 @@ async def resolve_workflow_run_conflict(
 ):
     """Resolve a paused workflow run conflict and resume execution."""
     try:
-        workflow = db_manager.get_user_workflow(workflow_id, user.id)
+        workflow = db_manager.get_user_workflow(workflow_id)
         if not workflow:
             raise HTTPException(status_code=404, detail="Workflow not found")
 
@@ -3823,7 +3835,7 @@ async def resolve_workflow_run_conflict(
             raise HTTPException(status_code=400, detail="selection is required")
 
         from workflows.workflow_engine import WorkflowExecutionEngine
-        engine = WorkflowExecutionEngine(db_manager, user.id)
+        engine = WorkflowExecutionEngine(db_manager, workflow.owner_user_id)
 
         loop = asyncio.get_running_loop()
 
@@ -3856,7 +3868,7 @@ async def list_workflow_runs(
 ):
     """List runs for a workflow."""
     try:
-        workflow = db_manager.get_user_workflow(workflow_id, user.id)
+        workflow = db_manager.get_user_workflow(workflow_id)
         if not workflow:
             raise HTTPException(status_code=404, detail="Workflow not found")
 
@@ -3877,7 +3889,7 @@ async def get_workflow_run(
 ):
     """Get details of a specific workflow run."""
     try:
-        workflow = db_manager.get_user_workflow(workflow_id, user.id)
+        workflow = db_manager.get_user_workflow(workflow_id)
         if not workflow:
             raise HTTPException(status_code=404, detail="Workflow not found")
 
@@ -3901,7 +3913,7 @@ async def cancel_workflow_run(
 ):
     """Cancel a running workflow."""
     try:
-        workflow = db_manager.get_user_workflow(workflow_id, user.id)
+        workflow = db_manager.get_user_workflow(workflow_id)
         if not workflow:
             raise HTTPException(status_code=404, detail="Workflow not found")
 
@@ -5968,12 +5980,52 @@ def _fetch_notion_database_schema(database_id: str, headers: Dict[str, str]) -> 
             timeout=30,
         )
         if resp.status_code == 200:
-            db_data = resp.json()
+            db_data = resp.json() or {}
+            data_sources = db_data.get("data_sources") or []
+            ds_id = None
+            if isinstance(data_sources, list) and data_sources:
+                first = data_sources[0]
+                if isinstance(first, dict):
+                    ds_id = first.get("id")
+
+            if ds_id:
+                ds_resp = requests.get(
+                    f"https://api.notion.com/v1/data_sources/{ds_id}",
+                    headers=headers,
+                    timeout=30,
+                )
+                if ds_resp.status_code == 200:
+                    ds_data = ds_resp.json() or {}
+                    return {
+                        "properties": ds_data.get("properties", {}),
+                        "title": db_data.get("title", []),
+                        "description": db_data.get("description", []),
+                        "is_inline": db_data.get("is_inline", False),
+                        "data_source_id": ds_id,
+                    }
+
             return {
                 "properties": db_data.get("properties", {}),
                 "title": db_data.get("title", []),
                 "description": db_data.get("description", []),
                 "is_inline": db_data.get("is_inline", False),
+            }
+
+        # Also support passing a data_source_id directly (common in 2025+).
+        ds_resp = requests.get(
+            f"https://api.notion.com/v1/data_sources/{database_id}",
+            headers=headers,
+            timeout=30,
+        )
+        if ds_resp.status_code == 200:
+            ds_data = ds_resp.json() or {}
+            parent = ds_data.get("parent") or {}
+            return {
+                "properties": ds_data.get("properties", {}),
+                "title": ds_data.get("title", []),
+                "description": ds_data.get("description", []),
+                "data_source_id": ds_data.get("id") or database_id,
+                "database_id": parent.get("database_id"),
             }
     except Exception as e:
         logger.warning(f"Error fetching database schema for {database_id}: {e}")
@@ -6020,7 +6072,7 @@ def _run_notion_pipeline(
     try:
         headers = {
             "Authorization": f"Bearer {token}",
-            "Notion-Version": "2022-06-28",
+            "Notion-Version": Config.NOTION_VERSION,
             "Content-Type": "application/json",
         }
 
@@ -6081,7 +6133,7 @@ def _run_notion_pipeline(
 
             for page in results:
                 obj_type = page.get("object")
-                if obj_type not in ("page", "database"):
+                if obj_type not in ("page", "database", "data_source"):
                     continue
 
                 parent_obj = page.get("parent", {}) or {}
@@ -6091,13 +6143,16 @@ def _run_notion_pipeline(
                     parent_id = parent_obj.get("page_id")
                 elif parent_type == "database_id":
                     parent_id = parent_obj.get("database_id")
+                elif parent_type == "data_source_id":
+                    parent_id = parent_obj.get("database_id") or parent_obj.get("data_source_id")
 
+                normalized_obj_type = "database" if obj_type == "data_source" else obj_type
                 page_data: Dict[str, Any] = {
                     "id": page.get("id"),
                     "title": _extract_notion_title(page),
                     "url": page.get("url"),
                     "last_edited_time": page.get("last_edited_time"),
-                    "object_type": obj_type,
+                    "object_type": normalized_obj_type,
                     "parent_id": parent_id,
                     "icon": page.get("icon"),
                     "cover": page.get("cover"),
@@ -6107,8 +6162,8 @@ def _run_notion_pipeline(
                 # Deep fetch blocks and schema if enabled
                 if deep_fetch:
                     page_id = page.get("id")
-                    if obj_type == "database":
-                        # Fetch database schema
+                    if obj_type in ("database", "data_source"):
+                        # Fetch database schema (properties live on data source in 2025 API)
                         schema = _fetch_notion_database_schema(page_id, headers)
                         if schema:
                             page_data["schema_data"] = schema
@@ -6479,7 +6534,7 @@ async def get_notion_page_content(
 
     headers = {
         "Authorization": f"Bearer {token}",
-        "Notion-Version": "2022-06-28",
+        "Notion-Version": Config.NOTION_VERSION,
         "Content-Type": "application/json",
     }
 
@@ -6505,6 +6560,16 @@ async def get_notion_page_content(
         )
         if page_meta_resp.status_code == 200:
             page_meta = page_meta_resp.json()
+
+            with db_manager.get_session() as session:
+                existing = session.query(NotionPage).filter_by(page_id=page_id).first()
+                workspace_id = (
+                    existing.workspace_id
+                    if existing and existing.workspace_id
+                    else (Config.WORKSPACE_ID or "default-notion-workspace")
+                )
+                ws = session.query(NotionWorkspace).filter_by(workspace_id=workspace_id).first()
+                workspace_name = ws.name if ws and ws.name else (Config.WORKSPACE_NAME or "Notion Workspace")
 
             blocks_tree = _fetch_notion_blocks(page_id, headers, max_depth=3)
             flat_blocks = _flatten_notion_block_tree(blocks_tree)
@@ -6562,16 +6627,6 @@ async def get_notion_page_content(
             elif parent_type == "database_id":
                 parent_id = parent_obj.get("database_id")
 
-            with db_manager.get_session() as session:
-                existing = session.query(NotionPage).filter_by(page_id=page_id).first()
-                workspace_id = (
-                    existing.workspace_id
-                    if existing and existing.workspace_id
-                    else (Config.WORKSPACE_ID or "default-notion-workspace")
-                )
-                ws = session.query(NotionWorkspace).filter_by(workspace_id=workspace_id).first()
-                workspace_name = ws.name if ws and ws.name else (Config.WORKSPACE_NAME or "Notion Workspace")
-
             page_data: Dict[str, Any] = {
                 "id": page_id,
                 "title": _extract_notion_title(page_meta),
@@ -6602,7 +6657,7 @@ async def get_notion_page_content(
             timeout=30,
         )
         if db_meta_resp.status_code == 200:
-            db_meta = db_meta_resp.json()
+            db_meta = db_meta_resp.json() or {}
             db_data = _query_notion_database_for_api(page_id)
 
             with db_manager.get_session() as session:
@@ -6621,8 +6676,9 @@ async def get_notion_page_content(
             if parent_type == "page_id":
                 parent_id = parent_obj.get("page_id")
 
+            db_properties = db_data.get("properties") if isinstance(db_data, dict) else {}
             schema_data = _build_database_schema_cache(
-                properties=db_meta.get("properties", {}) or {},
+                properties=db_properties if isinstance(db_properties, dict) else {},
                 db_data=db_data,
             )
             schema_data["title"] = db_meta.get("title", [])
@@ -6639,6 +6695,61 @@ async def get_notion_page_content(
                 "icon": db_meta.get("icon"),
                 "cover": db_meta.get("cover"),
                 "raw": db_meta,
+                "schema_data": schema_data,
+            }
+            _persist_notion_pages(workspace_id, workspace_name, [page_data], full_refresh=False)
+            _notion_hierarchy_cache = (0.0, {})
+
+            return {
+                "page_id": page_id,
+                "content": "",
+                "attachments": [],
+                "is_database": True,
+                "database": db_data,
+                "child_databases": [],
+                "refreshed": True,
+            }
+
+        ds_meta_resp = requests.get(
+            f"https://api.notion.com/v1/data_sources/{page_id}",
+            headers=headers,
+            timeout=30,
+        )
+        if ds_meta_resp.status_code == 200:
+            ds_meta = ds_meta_resp.json() or {}
+            db_data = _query_notion_database_for_api(page_id)
+
+            with db_manager.get_session() as session:
+                existing = session.query(NotionPage).filter_by(page_id=page_id).first()
+                workspace_id = (
+                    existing.workspace_id
+                    if existing and existing.workspace_id
+                    else (Config.WORKSPACE_ID or "default-notion-workspace")
+                )
+                ws = session.query(NotionWorkspace).filter_by(workspace_id=workspace_id).first()
+                workspace_name = ws.name if ws and ws.name else (Config.WORKSPACE_NAME or "Notion Workspace")
+
+            db_properties = ds_meta.get("properties", {}) if isinstance(ds_meta, dict) else {}
+            schema_data = _build_database_schema_cache(
+                properties=db_properties if isinstance(db_properties, dict) else {},
+                db_data=db_data,
+            )
+            schema_data["title"] = ds_meta.get("title", [])
+            schema_data["description"] = ds_meta.get("description", [])
+
+            parent_obj = ds_meta.get("parent", {}) or {}
+            parent_id = parent_obj.get("database_id")
+
+            page_data = {
+                "id": page_id,
+                "title": "".join(t.get("plain_text", "") for t in ds_meta.get("title", [])) or "Untitled",
+                "url": ds_meta.get("url"),
+                "last_edited_time": ds_meta.get("last_edited_time"),
+                "object_type": "database",
+                "parent_id": parent_id,
+                "icon": ds_meta.get("icon"),
+                "cover": ds_meta.get("cover"),
+                "raw": ds_meta,
                 "schema_data": schema_data,
             }
             _persist_notion_pages(workspace_id, workspace_name, [page_data], full_refresh=False)
@@ -6676,6 +6787,12 @@ async def startup_event():
 async def shutdown_event():
     """Run on application shutdown."""
     logger.info("Shutting down Workforce AI Agent API...")
+
+    try:
+        if ai_brain and hasattr(ai_brain, "close"):
+            await ai_brain.close()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

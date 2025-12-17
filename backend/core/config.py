@@ -49,6 +49,7 @@ class Config:
     # Notion credentials
     NOTION_TOKEN = os.getenv("NOTION_TOKEN", "")
     NOTION_PARENT_PAGE_ID = os.getenv("NOTION_PARENT_PAGE_ID", "")
+    NOTION_VERSION = os.getenv("NOTION_VERSION", "2025-09-03")
     
     # Notion pipeline settings
     NOTION_PIPELINE_MAX_PAGES = int(os.getenv("NOTION_PIPELINE_MAX_PAGES", "2000"))
