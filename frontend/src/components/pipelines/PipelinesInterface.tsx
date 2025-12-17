@@ -108,6 +108,15 @@ export default function PipelinesInterface() {
   const [slackChannelRunChannelId, setSlackChannelRunChannelId] = useState<string | null>(null)
   const [slackChannelRunStatus, setSlackChannelRunStatus] = useState<string | null>(null)
   const [slackChannelProgress, setSlackChannelProgress] = useState<number | null>(null)
+  const [slackChannelStats, setSlackChannelStats] = useState<{
+    stage?: string
+    stage_description?: string
+    pages_fetched?: number
+    messages_fetched?: number
+    total_messages?: number
+    eta_seconds?: number
+    rate_limit_info?: string
+  } | null>(null)
   const [slackMessages, setSlackMessages] = useState<SlackMessage[]>([])
   // Channel list search
   const [slackSearchQuery, setSlackSearchQuery] = useState('')
@@ -378,10 +387,24 @@ export default function PipelinesInterface() {
         const progressVal =
           data?.stats?.progress != null ? Math.min(1, Math.max(0, data.stats.progress)) : null
         setSlackChannelProgress(progressVal)
+        
+        // Extract detailed stats for ETA display
+        if (data?.stats) {
+          setSlackChannelStats({
+            stage: data.stats.stage,
+            stage_description: data.stats.stage_description,
+            pages_fetched: data.stats.pages_fetched,
+            messages_fetched: data.stats.messages_fetched,
+            total_messages: data.stats.total_messages,
+            eta_seconds: data.stats.eta_seconds,
+            rate_limit_info: data.stats.rate_limit_info,
+          })
+        }
 
         if (['completed', 'failed', 'cancelled'].includes(data.status)) {
           done = true
           setSlackIsRunning(false)
+          setSlackChannelStats(null)
           if (data.finished_at || data.started_at) {
             setSlackLastRunAt(data.finished_at || data.started_at)
           } else {
@@ -409,6 +432,7 @@ export default function PipelinesInterface() {
         console.error('Error polling Slack channel pipeline status:', err)
         setError(err.message || 'Failed to poll channel run status')
         setSlackIsRunning(false)
+        setSlackChannelStats(null)
         done = true
       }
     }
@@ -1014,13 +1038,49 @@ export default function PipelinesInterface() {
   // Render helpers
   // -----------------------------
 
+  // Helper to format ETA seconds into human-readable string
+  const formatEta = (seconds: number | undefined) => {
+    if (seconds === undefined || seconds <= 0) return null
+    if (seconds < 60) return `~${seconds}s remaining`
+    const mins = Math.floor(seconds / 60)
+    const secs = seconds % 60
+    return `~${mins}m ${secs}s remaining`
+  }
+
   const renderSlackView = () => {
-    const channelProgressDisplay =
-      slackChannelRunStatus || slackChannelProgress != null
-        ? `Refresh status: ${slackChannelRunStatus || 'running'}${
-            slackChannelProgress != null ? ` · ${(slackChannelProgress * 100).toFixed(0)}%` : ''
-          }`
-        : null
+    // Build detailed progress display for channel refresh
+    let channelProgressDisplay: React.ReactNode = null
+    if (slackChannelRunStatus || slackChannelProgress != null) {
+      const progressPct = slackChannelProgress != null ? `${(slackChannelProgress * 100).toFixed(0)}%` : ''
+      const stageDesc = slackChannelStats?.stage_description || slackChannelRunStatus || 'running'
+      const msgCount = slackChannelStats?.messages_fetched
+      const etaStr = formatEta(slackChannelStats?.eta_seconds)
+      
+      channelProgressDisplay = (
+        <div className="mt-2 p-2 rounded-md bg-blue-950/30 border border-blue-800/50">
+          <div className="flex items-center justify-between mb-1">
+            <span className="text-xs font-medium text-blue-300">{stageDesc}</span>
+            <span className="text-xs text-blue-400">{progressPct}</span>
+          </div>
+          {/* Progress bar */}
+          <div className="h-1.5 bg-blue-900/50 rounded-full overflow-hidden mb-1">
+            <div 
+              className="h-full bg-blue-500 transition-all duration-300" 
+              style={{ width: `${(slackChannelProgress || 0) * 100}%` }}
+            />
+          </div>
+          <div className="flex items-center justify-between text-[10px] text-blue-400/80">
+            {msgCount !== undefined && <span>{msgCount} messages fetched</span>}
+            {etaStr && <span>{etaStr}</span>}
+          </div>
+          {slackChannelStats?.rate_limit_info && (
+            <p className="text-[10px] text-muted-foreground mt-1">
+              ⏱ {slackChannelStats.rate_limit_info}
+            </p>
+          )}
+        </div>
+      )
+    }
 
     const channelListProgressDisplay =
       slackListRefreshing || slackListRunStatus || slackListProgress != null
@@ -1065,9 +1125,7 @@ export default function PipelinesInterface() {
             {slackRunId && (
               <p className="mt-1 text-[11px] text-muted-foreground break-all">Run ID: {slackRunId}</p>
             )}
-            {channelProgressDisplay && (
-              <p className="mt-1 text-[11px] text-muted-foreground">{channelProgressDisplay}</p>
-            )}
+            {channelProgressDisplay}
           </div>
 
           {slackStats && (
