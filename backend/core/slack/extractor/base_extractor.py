@@ -120,6 +120,18 @@ class BaseExtractor:
         pages_fetched = 0
         has_more = True
         
+        # Send initial progress immediately so UI shows something
+        if progress_callback:
+            progress_callback({
+                "stage": "fetching",
+                "stage_description": f"Starting to fetch messages from Slack...",
+                "pages_fetched": 0,
+                "messages_fetched": 0,
+                "progress": 0.02,
+                "eta_seconds": int(seconds_per_request),
+                "rate_limit_info": f"Slack rate limit: ~{seconds_per_request:.0f}s between API calls",
+            })
+        
         while has_more:
             # Check for cancellation
             if cancel_check and cancel_check():
