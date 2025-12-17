@@ -1,0 +1,53 @@
+# Environment variables
+.env
+.env.local
+
+# Python bytecode / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Credentials and tokens (keep secrets out of git)
+google-credentials.json
+credentials.json
+*.pickle
+token.json
+
+# IDE / OS-specific
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+logs/
+*.log
+
+# Testing artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Misc caches / temp
+.cache/
+temp/
+tmp/
+
+node_modules/
+dist/
+frontend/node_modules/
+frontend/dist/
+Terminal Saved Output.txt
