@@ -89,6 +89,12 @@ interface WorkflowRun {
   created_at?: string
 }
 
+type WorkflowConflictOption = {
+  label: string
+  value: string
+  meta?: Record<string, unknown>
+}
+
 interface SlackChannel {
   id: string
   name: string
@@ -167,6 +173,12 @@ export default function WorkflowsInterfaceV2() {
   const [runHistory, setRunHistory] = useState<WorkflowRun[]>([])
   const [showRunHistory, setShowRunHistory] = useState(false)
 
+  const [conflictDialogOpen, setConflictDialogOpen] = useState(false)
+  const [conflictTitle, setConflictTitle] = useState<string>('')
+  const [conflictMessage, setConflictMessage] = useState<string>('')
+  const [conflictOptions, setConflictOptions] = useState<WorkflowConflictOption[]>([])
+  const [conflictSubmitting, setConflictSubmitting] = useState(false)
+
   const selectedWorkflow = workflows.find(w => w.id === selectedWorkflowId) || null
 
   // Load workflows
@@ -238,6 +250,85 @@ export default function WorkflowsInterfaceV2() {
       loadRunHistory(selectedWorkflowId)
     }
   }, [selectedWorkflowId, loadRunHistory])
+
+  const refreshRun = useCallback(async (workflowId: string, runId: string) => {
+    const runRes = await fetch(`${API_BASE_URL}/api/v2/workflows/${workflowId}/runs/${runId}`, {
+      credentials: 'include',
+    })
+    if (!runRes.ok) return
+    const runData = await runRes.json()
+    setCurrentRun(runData)
+  }, [])
+
+  useEffect(() => {
+    if (!selectedWorkflowId || !currentRun?.id) return
+    if (
+      currentRun.status !== 'pending' &&
+      currentRun.status !== 'running' &&
+      currentRun.status !== 'awaiting_user_input'
+    ) {
+      return
+    }
+
+    const interval = window.setInterval(() => {
+      refreshRun(selectedWorkflowId, currentRun.id)
+    }, 2000)
+
+    return () => {
+      window.clearInterval(interval)
+    }
+  }, [selectedWorkflowId, currentRun?.id, currentRun?.status, refreshRun])
+
+  useEffect(() => {
+    if (!selectedWorkflowId || !currentRun?.id) return
+
+    if (currentRun.status === 'awaiting_user_input') {
+      const out = (currentRun.output_result || {}) as Record<string, unknown>
+      const pending = (out.pending_user_input || {}) as Record<string, unknown>
+      const conflict = (pending.conflict || {}) as Record<string, unknown>
+      const options = (conflict.options || []) as WorkflowConflictOption[]
+
+      if (options.length > 0) {
+        setConflictTitle(String(conflict.title || 'Selection required'))
+        setConflictMessage(String(conflict.message || 'Please select one option to continue.'))
+        setConflictOptions(options)
+        setConflictDialogOpen(true)
+      }
+    }
+
+    if (
+      currentRun.status === 'completed' ||
+      currentRun.status === 'failed' ||
+      currentRun.status === 'cancelled'
+    ) {
+      loadRunHistory(selectedWorkflowId)
+      loadWorkflows()
+    }
+  }, [currentRun?.status, currentRun?.id, currentRun?.output_result, selectedWorkflowId, loadRunHistory, loadWorkflows])
+
+  const handleResolveConflict = async (selection: string) => {
+    if (!selectedWorkflowId || !currentRun?.id) return
+    try {
+      setConflictSubmitting(true)
+      const res = await fetch(
+        `${API_BASE_URL}/api/v2/workflows/${selectedWorkflowId}/runs/${currentRun.id}/resolve`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({ selection }),
+        }
+      )
+      if (!res.ok) throw new Error('Failed to resolve conflict')
+      setConflictDialogOpen(false)
+      await refreshRun(selectedWorkflowId, currentRun.id)
+    } catch (e: unknown) {
+      const err = e as Error
+      setError(err.message)
+    } finally {
+      setConflictSubmitting(false)
+    }
+  }
 
   // Keep selection in sync
   useEffect(() => {
@@ -354,13 +445,7 @@ export default function WorkflowsInterfaceV2() {
       
       // Load the run details
       if (result.run_id) {
-        const runRes = await fetch(`${API_BASE_URL}/api/v2/workflows/${selectedWorkflowId}/runs/${result.run_id}`, {
-          credentials: 'include',
-        })
-        if (runRes.ok) {
-          const runData = await runRes.json()
-          setCurrentRun(runData)
-        }
+        await refreshRun(selectedWorkflowId, result.run_id)
       }
       
       // Refresh run history
@@ -400,7 +485,10 @@ export default function WorkflowsInterfaceV2() {
   }
 
   // Check if workflow is currently running
-  const isWorkflowRunning = currentRun?.status === 'running' || runLoading
+  const isWorkflowRunning =
+    currentRun?.status === 'running' ||
+    currentRun?.status === 'awaiting_user_input' ||
+    runLoading
 
   // Get source summary for display
   const getSourceSummary = (config: SourceConfig) => {
@@ -447,6 +535,39 @@ export default function WorkflowsInterfaceV2() {
 
   return (
     <div className="flex h-full bg-background">
+      <Dialog open={conflictDialogOpen} onOpenChange={setConflictDialogOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{conflictTitle}</DialogTitle>
+          </DialogHeader>
+          <div className="text-sm text-muted-foreground">
+            {conflictMessage}
+          </div>
+          <div className="mt-3 space-y-2 max-h-64 overflow-auto">
+            {conflictOptions.map((opt) => (
+              <Button
+                key={opt.value}
+                variant="secondary"
+                className="w-full justify-start"
+                disabled={conflictSubmitting}
+                onClick={() => handleResolveConflict(opt.value)}
+              >
+                {opt.label}
+              </Button>
+            ))}
+          </div>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setConflictDialogOpen(false)}
+              disabled={conflictSubmitting}
+            >
+              Close
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {/* Delete Confirmation Dialog */}
       <AlertDialog open={deleteTargetId !== null} onOpenChange={(open) => !open && setDeleteTargetId(null)}>
         <AlertDialogContent>
@@ -839,19 +960,12 @@ export default function WorkflowsInterfaceV2() {
                   const progressValue: number =
                     currentRun?.progress_percent ?? (runLoading ? 10 : 0)
                   return (
-                <div className="h-2 bg-muted rounded-full mb-3 overflow-hidden">
-                  <progress
-                    className="sr-only"
-                    value={progressValue}
-                    max={100}
-                    aria-label="Workflow progress"
-                  />
-                  <div
-                    className="h-full bg-blue-500 transition-all duration-300"
-                    style={{ width: `${progressValue}%` }}
-                    aria-hidden="true"
-                  />
-                </div>
+                    <progress
+                      className="w-full h-2 rounded-full overflow-hidden accent-blue-500"
+                      value={progressValue}
+                      max={100}
+                      aria-label="Workflow progress"
+                    />
                   )
                 })()}
 
@@ -882,6 +996,20 @@ export default function WorkflowsInterfaceV2() {
                       {currentRun.ai_response.substring(0, 500)}
                       {currentRun.ai_response.length > 500 && '...'}
                     </div>
+                  </div>
+                )}
+
+                {/* Output Result */}
+                {currentRun?.output_result && (
+                  <div className="mt-3">
+                    <details className="bg-background rounded-md p-2 text-xs">
+                      <summary className="cursor-pointer text-xs font-medium text-muted-foreground">
+                        Output Result
+                      </summary>
+                      <pre className="mt-2 whitespace-pre-wrap break-words">
+                        {JSON.stringify(currentRun.output_result, null, 2)}
+                      </pre>
+                    </details>
                   </div>
                 )}
 

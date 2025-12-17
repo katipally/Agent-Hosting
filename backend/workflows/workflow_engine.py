@@ -94,14 +94,58 @@ List what you are doing in human-readable form:
 """
 
 
-TOOL_CALLING_SYSTEM_PROMPT = """You are an AI agent executing an automated workflow.
+TOOL_CALLING_SYSTEM_PROMPT = """You are an AI agent executing an automated workflow that syncs data between apps.
 
-You can call tools to read and write to Slack, Gmail, Notion, and Calendar.
+## EXECUTION PROCESS (follow strictly)
 
-Rules:
-1) Use tools when needed.
-2) Only perform write actions to the destinations configured in the workflow outputs.
-3) After finishing tool calls, return a concise final summary of what you did.
+### Phase 1: UNDERSTAND SOURCE DATA
+- Read and analyze the source data provided (Slack messages, Gmail emails, etc.)
+- Extract key information: status changes, action items, dates, people, decisions
+- Identify what has changed since last sync
+
+### Phase 2: UNDERSTAND DESTINATION STRUCTURE
+- Before writing ANYTHING, first query the destination to understand its structure
+- For Notion databases: use `query_notion_database` to see the schema, existing rows, and current values
+- For Notion pages: use `get_notion_structured_context` to see the page structure, sections, and content
+- Identify WHERE updates should go (which row, which field, which section)
+ - If the destination is a Notion database row page, and you need to query the database, use the **Parent Database ID** from destination state (do NOT pass the row page_id to `query_notion_database`).
+
+### Phase 3: PLAN TARGETED UPDATES
+- Determine exactly what needs to change based on source vs destination comparison
+- Plan specific updates: which field to change, what value to set
+- DO NOT plan to append raw summaries - plan to UPDATE specific fields/rows
+
+### Phase 4: EXECUTE PRECISE UPDATES
+For Notion destinations:
+
+1) If the destination is a **Notion database row page** (a page whose parent is a database_id):
+- Update the **page properties** (Status / Next Step / values) using entry_id-based tools.
+- Prefer `update_notion_database_entry_properties` (multi-field) or `update_notion_database_entry` (single-field).
+- Do NOT replace or rewrite the page body. Do NOT remove headings/toggles.
+
+2) If the destination is a **Notion database** (database_id):
+- Update a specific row by entry_id (preferred) or by name if unambiguous.
+- Create a new row only if no existing row matches.
+
+3) Only if the destination is a **regular Notion page** (not a database row):
+- Prefer targeted edits using block-level tools.
+- Use `replace_notion_page_content` ONLY when the workflow output explicitly configured mode='replace'.
+
+## CRITICAL RULES
+
+1. **NEVER append raw AI thinking/planning to destinations** - Users don't want to see "### THINKING" or "### ACTIONS_TAKEN" in their Notion pages
+
+2. **Update existing data, don't just append** - If a Status field says "Waiting for files" and files arrived, UPDATE the Status to "Files received", don't append text saying "files were received"
+
+3. **Match destination schema** - If Notion has a "Status" select field, update THAT field. If it has a "Next Steps" text field, update THAT field. Don't create unstructured text.
+
+4. **Be surgical** - Only change what needs to change. If source says "project paused", update the Status field to "Paused" and maybe Next Steps to the reason - don't rewrite the whole page.
+
+5. **Respect field types** - Select fields need valid option values; dates need date format; multi-select needs array format.
+
+## OUTPUT FORMAT
+Before your FIRST write tool call, include a short **PLAN** in the assistant message (this is for logs/UI only; it is NOT written to destinations).
+After completing all tool calls, return a brief summary of what was updated (for logging purposes only - this is NOT written to destinations).
 """
 
 
@@ -212,7 +256,11 @@ class WorkflowExecutionEngine:
                     self._log(run_id, "error", msg)
             raise
 
-    def _workflow_tools_schema(self, output_config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _workflow_tools_schema(
+        self,
+        output_config: Dict[str, Any],
+        notion_row_page_targets: Optional[set[str]] = None,
+    ) -> List[Dict[str, Any]]:
         """Tool schema exposed to the LLM during workflow runs.
 
         We always allow read/search tools. Write tools are limited to the selected
@@ -228,9 +276,24 @@ class WorkflowExecutionEngine:
             elif t == "gmail_draft":
                 allowed_writes.add("create_gmail_draft")
             elif t == "notion_page":
-                allowed_writes.add("append_to_notion_page")
-                allowed_writes.add("replace_notion_page_content")
-                allowed_writes.add("update_notion_database_row_content")
+                target_page_id = o.get("page_id")
+                is_row_page = bool(target_page_id and notion_row_page_targets and target_page_id in notion_row_page_targets)
+
+                allowed_writes.add("update_notion_entry_by_name")
+                allowed_writes.add("update_notion_database_entry")
+                allowed_writes.add("update_notion_database_entry_properties")
+
+                if not is_row_page:
+                    allowed_writes.add("append_to_notion_page")
+                    mode = (o.get("mode") or "append").lower()
+                    if mode == "replace":
+                        allowed_writes.add("replace_notion_page_content")
+                    allowed_writes.add("update_notion_database_row_content")
+                    allowed_writes.add("update_notion_database_schema")
+                    allowed_writes.add("update_notion_todo_checked")
+                    allowed_writes.add("update_notion_block_text")
+                    allowed_writes.add("add_notion_database_entry")
+                    allowed_writes.add("delete_notion_database_entry")
                 # If no target page provided, allow creation.
                 if not o.get("page_id"):
                     allowed_writes.add("create_notion_page")
@@ -348,9 +411,27 @@ class WorkflowExecutionEngine:
                             "database_id": {"type": "string"},
                             "filter_json": {"type": "string"},
                             "sort_json": {"type": "string"},
+                            "search_text": {"type": "string", "description": "Optional: simple text search across row properties (preferred over filter_json if you are unsure)."},
                             "page_size": {"type": "integer", "default": 50},
                         },
                         "required": ["database_id"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_notion_structured_context",
+                    "description": "Get structured JSON context of a Notion page or database with all IDs for precise edits. Use this before making targeted updates.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "page_id": {"type": "string", "description": "Notion page or database ID"},
+                            "include_blocks": {"type": "boolean", "default": True},
+                            "include_database_rows": {"type": "boolean", "default": True},
+                            "max_depth": {"type": "integer", "default": 3},
+                        },
+                        "required": ["page_id"],
                     },
                 },
             },
@@ -443,10 +524,138 @@ class WorkflowExecutionEngine:
                         "properties": {
                             "database_id": {"type": "string"},
                             "entry_name": {"type": "string"},
+                            "entry_id": {"type": "string"},
                             "content": {"type": "string"},
                             "mode": {"type": "string", "default": "replace"},
                         },
                         "required": ["database_id", "entry_name", "content"],
+                    },
+                },
+            },
+            "update_notion_entry_by_name": {
+                "type": "function",
+                "function": {
+                    "name": "update_notion_entry_by_name",
+                    "description": "Update a specific property of a Notion database entry by name. Use for changing status, checkbox, numbers, dates, etc.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "database_id": {"type": "string", "description": "Database ID"},
+                            "entry_name": {"type": "string", "description": "Row/entry name to find"},
+                            "entry_id": {"type": "string", "description": "Optional: exact row page ID to update (recommended in workflows)"},
+                            "property_name": {"type": "string", "description": "Property/column name to update"},
+                            "new_value": {"type": "string", "description": "New value"},
+                            "property_type": {"type": "string", "description": "Optional: number, text, select, date, checkbox, url"},
+                        },
+                        "required": ["database_id", "entry_name", "property_name", "new_value"],
+                    },
+                },
+            },
+            "update_notion_database_entry": {
+                "type": "function",
+                "function": {
+                    "name": "update_notion_database_entry",
+                    "description": "Update a specific property of a Notion database row by entry/page ID (recommended for workflows).",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "entry_id": {"type": "string", "description": "Row page ID"},
+                            "property_name": {"type": "string", "description": "Property/column name to update"},
+                            "new_value": {"description": "New value"},
+                            "property_type": {"type": "string", "description": "Optional: title, rich_text, number, select, status, date, checkbox, url, email"},
+                        },
+                        "required": ["entry_id", "property_name", "new_value"],
+                    },
+                },
+            },
+            "update_notion_database_entry_properties": {
+                "type": "function",
+                "function": {
+                    "name": "update_notion_database_entry_properties",
+                    "description": "Update multiple properties of a Notion database row by entry/page ID in one call. updates_json should be a JSON object of property_name -> value.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "entry_id": {"type": "string", "description": "Row page ID"},
+                            "updates_json": {"type": "string", "description": "JSON object mapping property names to values"},
+                        },
+                        "required": ["entry_id", "updates_json"],
+                    },
+                },
+            },
+            "update_notion_database_schema": {
+                "type": "function",
+                "function": {
+                    "name": "update_notion_database_schema",
+                    "description": "Add, rename, or remove columns in a Notion database.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "database_id": {"type": "string"},
+                            "add_columns": {"type": "object", "description": "Dict of column_name: type (rich_text, number, select, checkbox, date, url, email, files, people)"},
+                            "rename_columns": {"type": "object", "description": "Dict of old_name: new_name"},
+                            "remove_columns": {"type": "array", "items": {"type": "string"}, "description": "List of column names to remove"},
+                        },
+                        "required": ["database_id"],
+                    },
+                },
+            },
+            "update_notion_todo_checked": {
+                "type": "function",
+                "function": {
+                    "name": "update_notion_todo_checked",
+                    "description": "Check or uncheck a to-do item in Notion. Use get_notion_structured_context first to get block IDs.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "block_id": {"type": "string", "description": "The to_do block ID"},
+                            "checked": {"type": "boolean", "description": "True to check, False to uncheck"},
+                        },
+                        "required": ["block_id", "checked"],
+                    },
+                },
+            },
+            "update_notion_block_text": {
+                "type": "function",
+                "function": {
+                    "name": "update_notion_block_text",
+                    "description": "Update the text content of a Notion block. Use get_notion_structured_context first to get block IDs.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "block_id": {"type": "string", "description": "The block ID to update"},
+                            "new_text": {"type": "string", "description": "New text content"},
+                        },
+                        "required": ["block_id", "new_text"],
+                    },
+                },
+            },
+            "add_notion_database_entry": {
+                "type": "function",
+                "function": {
+                    "name": "add_notion_database_entry",
+                    "description": "Add a new row/entry to a Notion database.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "database_id": {"type": "string"},
+                            "properties": {"type": "object", "description": "Dict of property_name: value pairs"},
+                        },
+                        "required": ["database_id", "properties"],
+                    },
+                },
+            },
+            "delete_notion_database_entry": {
+                "type": "function",
+                "function": {
+                    "name": "delete_notion_database_entry",
+                    "description": "Archive (delete) a Notion database entry by ID.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "entry_id": {"type": "string", "description": "Entry/page ID to archive"},
+                        },
+                        "required": ["entry_id"],
                     },
                 },
             },
@@ -479,11 +688,13 @@ class WorkflowExecutionEngine:
                 query=arguments.get("query", ""),
                 channel=arguments.get("channel") or None,
                 limit=int(arguments.get("limit", 10) or 10),
+                workflow_mode=True,
             )
         if tool_name == "get_channel_messages":
             return tools_handler.get_channel_messages(
                 channel=arguments.get("channel", ""),
                 limit=int(arguments.get("limit", 100) or 100),
+                workflow_mode=True,
             )
         if tool_name == "get_thread_replies":
             return tools_handler.get_thread_replies(
@@ -530,6 +741,7 @@ class WorkflowExecutionEngine:
                 database_id=arguments.get("database_id", ""),
                 filter_json=arguments.get("filter_json"),
                 sort_json=arguments.get("sort_json"),
+                search_text=arguments.get("search_text"),
                 page_size=int(arguments.get("page_size", 50) or 50),
             )
         if tool_name == "create_notion_page":
@@ -551,11 +763,112 @@ class WorkflowExecutionEngine:
             return tools_handler.update_notion_database_row_content(
                 database_id=arguments.get("database_id", ""),
                 entry_name=arguments.get("entry_name", ""),
+                entry_id=arguments.get("entry_id") or None,
                 content=arguments.get("content", ""),
                 mode=arguments.get("mode", "replace"),
+                workflow_mode=True,
             )
+        
+        # Advanced Notion tools - Dec 2025
+        if tool_name == "get_notion_structured_context":
+            result = tools_handler.get_notion_structured_context(
+                page_id=arguments.get("page_id", ""),
+                include_blocks=bool(arguments.get("include_blocks", True)),
+                include_database_rows=bool(arguments.get("include_database_rows", True)),
+                max_depth=int(arguments.get("max_depth", 3) or 3),
+            )
+            self._log(run_id, "info", f"Retrieved structured Notion context for {arguments.get('page_id', '')}")
+            return result
+        
+        if tool_name == "update_notion_database_schema":
+            result = tools_handler.update_notion_database_schema(
+                database_id=arguments.get("database_id", ""),
+                add_columns=arguments.get("add_columns"),
+                rename_columns=arguments.get("rename_columns"),
+                remove_columns=arguments.get("remove_columns"),
+            )
+            self._log(run_id, "info", f"Schema update result: {result}")
+            return result
+        
+        if tool_name == "update_notion_todo_checked":
+            result = tools_handler.update_notion_todo_checked(
+                block_id=arguments.get("block_id", ""),
+                checked=bool(arguments.get("checked", False)),
+            )
+            self._log(run_id, "info", f"To-do update result: {result}")
+            return result
+        
+        if tool_name == "update_notion_block_text":
+            result = tools_handler.update_notion_block_text(
+                block_id=arguments.get("block_id", ""),
+                new_text=arguments.get("new_text", ""),
+            )
+            self._log(run_id, "info", f"Block text update result: {result}")
+            return result
+        
+        if tool_name == "update_notion_entry_by_name":
+            result = tools_handler.update_notion_entry_by_name(
+                database_id=arguments.get("database_id", ""),
+                entry_name=arguments.get("entry_name", ""),
+                entry_id=arguments.get("entry_id") or None,
+                property_name=arguments.get("property_name", ""),
+                new_value=arguments.get("new_value"),
+                property_type=arguments.get("property_type"),
+                workflow_mode=True,
+            )
+            self._log(run_id, "info", f"Entry property update result: {result}")
+            return result
+
+        if tool_name == "update_notion_database_entry":
+            result = tools_handler.update_notion_database_entry(
+                entry_id=arguments.get("entry_id", ""),
+                property_name=arguments.get("property_name", ""),
+                new_value=arguments.get("new_value"),
+                property_type=arguments.get("property_type"),
+            )
+            self._log(run_id, "info", f"Entry property update result: {result}")
+            return result
+
+        if tool_name == "update_notion_database_entry_properties":
+            result = tools_handler.update_notion_database_entry_properties(
+                entry_id=arguments.get("entry_id", ""),
+                updates_json=arguments.get("updates_json", ""),
+            )
+            self._log(run_id, "info", f"Entry properties update result: {result}")
+            return result
+        
+        if tool_name == "add_notion_database_entry":
+            result = tools_handler.add_notion_database_entry(
+                database_id=arguments.get("database_id", ""),
+                properties=arguments.get("properties", {}),
+            )
+            self._log(run_id, "info", f"New entry result: {result}")
+            return result
+        
+        if tool_name == "delete_notion_database_entry":
+            result = tools_handler.delete_notion_database_entry(
+                entry_id=arguments.get("entry_id", ""),
+            )
+            self._log(run_id, "info", f"Delete entry result: {result}")
+            return result
 
         return f"Unknown tool: {tool_name}"
+
+    def _parse_conflict_result(self, result: Any) -> Optional[Dict[str, Any]]:
+        """Detect a structured conflict result returned by a tool.
+
+        Tools may return a JSON string like:
+        {"__workforce_conflict__": true, "options": [...], ...}
+        """
+        if not isinstance(result, str):
+            return None
+        try:
+            data = json.loads(result)
+        except Exception:
+            return None
+        if isinstance(data, dict) and data.get("__workforce_conflict__") is True:
+            return data
+        return None
 
     async def _run_tool_calling_agent(
         self,
@@ -565,6 +878,7 @@ class WorkflowExecutionEngine:
         prompt_config: Dict[str, Any],
         output_config: Dict[str, Any],
         run_id: str,
+        resume_state: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Run an OpenAI tool-calling loop to decide and execute actions.
 
@@ -593,7 +907,36 @@ class WorkflowExecutionEngine:
         outputs_summary = json.dumps(output_config.get("outputs", []), ensure_ascii=False)
         out_instr = "\n".join(output_instructions) if output_instructions else ""
 
-        tool_schema = self._workflow_tools_schema(output_config)
+        notion_row_page_targets: set[str] = set()
+        if Config.NOTION_TOKEN:
+            try:
+                import requests
+                headers = {
+                    "Authorization": f"Bearer {Config.NOTION_TOKEN}",
+                    "Notion-Version": "2022-06-28",
+                }
+                for o in output_config.get("outputs", []):
+                    if (o.get("type") == "notion_page") and o.get("page_id"):
+                        pid = o.get("page_id")
+                        try:
+                            resp = requests.get(
+                                f"https://api.notion.com/v1/pages/{pid}",
+                                headers=headers,
+                                timeout=12,
+                            )
+                            if resp.status_code == 200:
+                                parent = (resp.json() or {}).get("parent", {}) or {}
+                                if parent.get("type") == "database_id":
+                                    notion_row_page_targets.add(pid)
+                        except Exception:
+                            continue
+            except Exception:
+                notion_row_page_targets = set()
+
+        tool_schema = self._workflow_tools_schema(
+            output_config,
+            notion_row_page_targets=notion_row_page_targets,
+        )
 
         allowed_notion_targets = {
             o.get("page_id")
@@ -605,23 +948,29 @@ class WorkflowExecutionEngine:
             for o in output_config.get("outputs", [])
         )
 
-        messages: List[Dict[str, Any]] = [
-            {"role": "system", "content": TOOL_CALLING_SYSTEM_PROMPT},
-            {"role": "system", "content": "Workflow outputs configuration (do not write elsewhere):\n" + outputs_summary},
-        ]
+        if resume_state:
+            messages = list(resume_state.get("messages") or [])
+            executed_calls = list(resume_state.get("executed_calls") or [])
+            iterations = int(resume_state.get("iterations") or 0)
+        else:
+            messages = [
+                {"role": "system", "content": TOOL_CALLING_SYSTEM_PROMPT},
+                {"role": "system", "content": "Workflow outputs configuration (do not write elsewhere):\n" + outputs_summary},
+            ]
 
-        user_prompt = (
-            "## SOURCE DATA\n" + (source_data[:10000] or "") +
-            "\n\n## DESTINATION STATE\n" + (destination_state[:5000] or "") +
-            "\n\n## USER INSTRUCTIONS\n" + (user_instructions or "") +
-            ("\n\n## OUTPUT-SPECIFIC INSTRUCTIONS\n" + out_instr if out_instr else "") +
-            "\n\nUse tool calling to perform any required writes. Finish with a short summary."
-        )
-        messages.append({"role": "user", "content": user_prompt})
+            user_prompt = (
+                "## SOURCE DATA\n" + (source_data[:10000] or "") +
+                "\n\n## DESTINATION STATE\n" + (destination_state[:5000] or "") +
+                "\n\n## USER INSTRUCTIONS\n" + (user_instructions or "") +
+                ("\n\n## OUTPUT-SPECIFIC INSTRUCTIONS\n" + out_instr if out_instr else "") +
+                "\n\nUse tool calling to perform any required writes. Finish with a short summary."
+            )
+            messages.append({"role": "user", "content": user_prompt})
 
-        executed_calls: List[Dict[str, Any]] = []
+            executed_calls = []
+            iterations = 0
+
         max_iterations = 8
-        iterations = 0
 
         while iterations < max_iterations:
             iterations += 1
@@ -672,11 +1021,114 @@ class WorkflowExecutionEngine:
                 except Exception:
                     args = {}
 
-                # Enforce Notion destination scoping for write operations
                 if name in {"append_to_notion_page", "replace_notion_page_content"}:
                     target_id = args.get("page_id")
                     if allowed_notion_targets and target_id not in allowed_notion_targets:
                         result = "❌ Blocked: Notion write target does not match workflow output configuration."
+                        executed_calls.append({"name": name, "arguments": args, "result_preview": result})
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc.get("id"),
+                                "name": name,
+                                "content": result,
+                            }
+                        )
+                        continue
+
+                    if target_id and target_id in notion_row_page_targets:
+                        result = "❌ Blocked: Notion database-row destinations are properties-only; page body writes are disabled."
+                        executed_calls.append({"name": name, "arguments": args, "result_preview": result})
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc.get("id"),
+                                "name": name,
+                                "content": result,
+                            }
+                        )
+                        continue
+
+                if name in {"update_notion_block_text", "update_notion_todo_checked"}:
+                    target_id = args.get("page_id")
+                    if target_id and target_id in notion_row_page_targets:
+                        result = "❌ Blocked: Notion database-row destinations are properties-only; block edits are disabled."
+                        executed_calls.append({"name": name, "arguments": args, "result_preview": result})
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc.get("id"),
+                                "name": name,
+                                "content": result,
+                            }
+                        )
+                        continue
+
+                if name == "update_notion_database_row_content":
+                    target_id = args.get("database_id")
+                    if target_id and target_id in notion_row_page_targets:
+                        result = "❌ Blocked: Notion database-row destinations are properties-only; row content edits are disabled."
+                        executed_calls.append({"name": name, "arguments": args, "result_preview": result})
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc.get("id"),
+                                "name": name,
+                                "content": result,
+                            }
+                        )
+                        continue
+
+                if name == "update_notion_entry_by_name":
+                    # For workflows targeting a single Notion row/page, require entry_id to avoid wrong-row updates.
+                    entry_id = args.get("entry_id")
+                    target_db = args.get("database_id")
+
+                    allowed = True
+                    if allowed_notion_targets:
+                        if entry_id:
+                            allowed = entry_id in allowed_notion_targets
+                        else:
+                            # Only allow name-based updates when the output target is a database (not a row page).
+                            allowed = target_db in allowed_notion_targets
+
+                    if not allowed:
+                        result = "❌ Blocked: update_notion_entry_by_name requires entry_id for workflows targeting a specific Notion row/page."
+                        executed_calls.append({"name": name, "arguments": args, "result_preview": result})
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc.get("id"),
+                                "name": name,
+                                "content": result,
+                            }
+                        )
+                        continue
+
+                if name in {"update_notion_database_entry", "update_notion_database_entry_properties"}:
+                    entry_id = args.get("entry_id")
+                    allowed = (not allowed_notion_targets) or (entry_id in allowed_notion_targets)
+                    if (not allowed) and Config.NOTION_TOKEN and entry_id:
+                        try:
+                            import requests
+                            headers = {
+                                "Authorization": f"Bearer {Config.NOTION_TOKEN}",
+                                "Notion-Version": "2022-06-28",
+                            }
+                            resp = requests.get(
+                                f"https://api.notion.com/v1/pages/{entry_id}",
+                                headers=headers,
+                                timeout=15,
+                            )
+                            if resp.status_code == 200:
+                                parent = (resp.json() or {}).get("parent", {}) or {}
+                                if parent.get("type") == "database_id" and parent.get("database_id") in allowed_notion_targets:
+                                    allowed = True
+                        except Exception:
+                            pass
+
+                    if not allowed:
+                        result = "❌ Blocked: Notion entry target does not match workflow output configuration."
                         executed_calls.append({"name": name, "arguments": args, "result_preview": result})
                         messages.append(
                             {
@@ -724,6 +1176,36 @@ class WorkflowExecutionEngine:
                     gmail_account_email,
                 )
 
+                conflict = self._parse_conflict_result(result)
+                if conflict:
+                    pending = {
+                        "tool_call_id": tc.get("id"),
+                        "tool_name": name,
+                        "tool_arguments": args,
+                        "conflict": conflict,
+                    }
+                    # Persist minimal agent state so we can resume deterministically.
+                    state = {
+                        "messages": messages[-30:],
+                        "executed_calls": executed_calls,
+                        "iterations": iterations,
+                    }
+                    self._update_run(
+                        run_id,
+                        status="awaiting_user_input",
+                        current_step="awaiting_user_input",
+                        progress_percent=65,
+                        output_result={"pending_user_input": pending, "agent_state": state},
+                    )
+                    self._log(run_id, "info", "Workflow paused: awaiting user input to resolve a conflict")
+                    return {
+                        "status": "awaiting_user_input",
+                        "final_response": "",
+                        "tool_calls": executed_calls,
+                        "iterations": iterations,
+                        "pending_user_input": pending,
+                    }
+
                 executed_calls.append({"name": name, "arguments": args, "result_preview": str(result)[:500]})
                 messages.append(
                     {
@@ -741,7 +1223,83 @@ class WorkflowExecutionEngine:
             "iterations": iterations,
         }
 
-    async def execute_workflow(self, workflow_id: str) -> Dict[str, Any]:
+    async def resume_workflow_run(self, workflow_id: str, run_id: str, selection: str) -> Dict[str, Any]:
+        """Resume a paused workflow run after user selects a disambiguation option."""
+        workflow = self.db_manager.get_user_workflow(workflow_id, self.user_id)
+        if not workflow:
+            return {"error": "Workflow not found", "status": "failed"}
+
+        run = self.db_manager.get_workflow_run(run_id)
+        if not run or run.workflow_id != workflow_id:
+            return {"error": "Run not found", "status": "failed"}
+
+        output_result = run.output_result or {}
+        pending = (output_result.get("pending_user_input") or {}) if isinstance(output_result, dict) else {}
+        agent_state = (output_result.get("agent_state") or {}) if isinstance(output_result, dict) else {}
+
+        tool_name = pending.get("tool_name") or ""
+        tool_call_id = pending.get("tool_call_id")
+        tool_arguments = dict(pending.get("tool_arguments") or {})
+        conflict = pending.get("conflict") or {}
+
+        patch_key = conflict.get("patch_key")
+        if patch_key:
+            tool_arguments[patch_key] = selection
+
+        # Clear pending state and mark as running.
+        self._update_run(
+            run_id,
+            status="running",
+            current_step="processing_ai",
+            progress_percent=65,
+            error_message=None,
+            output_result={"pending_user_input": None, "agent_state": agent_state},
+        )
+
+        from agent.langchain_tools import WorkforceTools
+
+        tools_handler = WorkforceTools(user_id=self.user_id)
+        gmail_account_email = None
+        try:
+            gmail_account_email = getattr(getattr(tools_handler, "gmail_client", None), "user_email", None)
+        except Exception:
+            gmail_account_email = None
+
+        # Re-hydrate messages and inject the resolved tool result.
+        messages = list(agent_state.get("messages") or [])
+        executed_calls = list(agent_state.get("executed_calls") or [])
+        iterations = int(agent_state.get("iterations") or 0)
+
+        # Execute the resolved tool call deterministically.
+        resolved_result = self._execute_workflow_tool(
+            tools_handler,
+            tool_name,
+            tool_arguments,
+            run_id,
+            gmail_account_email,
+        )
+        executed_calls.append({"name": tool_name, "arguments": tool_arguments, "result_preview": str(resolved_result)[:500]})
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id or "call_resumed",
+                "name": tool_name,
+                "content": str(resolved_result),
+            }
+        )
+
+        # Continue the tool-calling loop.
+        resumed = await self._run_tool_calling_agent(
+            source_data="",
+            destination_state="",
+            prompt_config=workflow.prompt_config,
+            output_config=workflow.output_config,
+            run_id=run_id,
+            resume_state={"messages": messages, "executed_calls": executed_calls, "iterations": iterations},
+        )
+        return resumed
+
+    async def execute_workflow(self, workflow_id: str, run_id: Optional[str] = None) -> Dict[str, Any]:
         """Execute a complete workflow run.
         
         Returns:
@@ -752,9 +1310,14 @@ class WorkflowExecutionEngine:
         if not workflow:
             return {"error": "Workflow not found", "status": "failed"}
 
-        # Create run record
-        run = self.db_manager.create_workflow_run(workflow_id)
-        run_id = run.id
+        # Create or re-use run record
+        if run_id:
+            run = self.db_manager.get_workflow_run(run_id)
+            if not run or run.workflow_id != workflow_id:
+                return {"error": "Run not found", "status": "failed"}
+        else:
+            run = self.db_manager.create_workflow_run(workflow_id)
+            run_id = run.id
 
         try:
             # Start run
@@ -822,6 +1385,12 @@ class WorkflowExecutionEngine:
                     output_config=workflow.output_config,
                     run_id=run_id,
                 )
+                if agent_result.get("status") == "awaiting_user_input":
+                    return {
+                        "run_id": run_id,
+                        "status": "awaiting_user_input",
+                        "pending_user_input": agent_result.get("pending_user_input"),
+                    }
                 final_response = agent_result.get("final_response") or ""
                 executed_tool_calls = agent_result.get("tool_calls") or []
             except Exception as e:
@@ -848,6 +1417,10 @@ class WorkflowExecutionEngine:
                 "create_notion_page",
                 "append_to_notion_page",
                 "replace_notion_page_content",
+                "update_notion_entry_by_name",
+                "update_notion_database_entry",
+                "update_notion_database_entry_properties",
+                "update_notion_database_row_content",
             }
             executed_write_tools = {c.get("name") for c in executed_tool_calls if c.get("name") in write_tools}
 
@@ -873,7 +1446,16 @@ class WorkflowExecutionEngine:
                 elif ot == "gmail_draft" and "create_gmail_draft" not in executed_write_tools:
                     missing_outputs.append(o)
                 elif ot == "notion_page" and not (
-                    {"create_notion_page", "append_to_notion_page", "replace_notion_page_content"} & executed_write_tools
+                    {
+                        "create_notion_page",
+                        "append_to_notion_page",
+                        "replace_notion_page_content",
+                        "update_notion_entry_by_name",
+                        "update_notion_database_entry",
+                        "update_notion_database_entry_properties",
+                        "update_notion_database_row_content",
+                    }
+                    & executed_write_tools
                 ):
                     missing_outputs.append(o)
 
@@ -1050,15 +1632,149 @@ class WorkflowExecutionEngine:
 
     def _format_notion_pages(self, pages: List) -> str:
         """Format Notion pages for AI processing."""
-        formatted = []
+        def _flatten_block_tree(blocks: Any) -> List[Dict[str, Any]]:
+            flat: List[Dict[str, Any]] = []
+            stack: List[Dict[str, Any]] = []
+            if isinstance(blocks, list):
+                for b in blocks:
+                    if isinstance(b, dict):
+                        stack.append(b)
+            while stack:
+                block = stack.pop()
+                if not isinstance(block, dict):
+                    continue
+                flat.append(block)
+                children = block.get("_children")
+                if isinstance(children, list) and children:
+                    for child in children:
+                        if isinstance(child, dict):
+                            stack.append(child)
+            return flat
+
+        def _rich_text_to_plain(rt: Any) -> str:
+            if not isinstance(rt, list):
+                return ""
+            parts: List[str] = []
+            for item in rt:
+                if isinstance(item, dict):
+                    txt = item.get("plain_text")
+                    if txt:
+                        parts.append(str(txt))
+            return "".join(parts).strip()
+
+        def _extract_block_line(block: Dict[str, Any]) -> str:
+            b_type = block.get("type")
+            if not b_type:
+                return ""
+            payload = block.get(b_type)
+            payload = payload if isinstance(payload, dict) else {}
+
+            if b_type in {"child_page", "child_database"}:
+                title = payload.get("title")
+                if title:
+                    return f"[{b_type}] {title}"
+                return f"[{b_type}]"
+
+            text = _rich_text_to_plain(payload.get("rich_text"))
+            if not text:
+                # Some blocks may store text in other keys
+                text = _rich_text_to_plain(payload.get("title"))
+            if not text:
+                return ""
+
+            if b_type.startswith("heading_"):
+                level = b_type.split("_", 1)[1]
+                prefix = {"1": "#", "2": "##", "3": "###"}.get(level, "#")
+                return f"{prefix} {text}"
+            if b_type == "bulleted_list_item":
+                return f"- {text}"
+            if b_type == "numbered_list_item":
+                return f"1. {text}"
+            if b_type == "to_do":
+                checked = bool(payload.get("checked"))
+                return f"[{'x' if checked else ' '}] {text}"
+            if b_type == "quote":
+                return f"> {text}"
+            if b_type == "code":
+                lang = payload.get("language") or ""
+                lang = f" ({lang})" if lang else ""
+                return f"[code{lang}] {text}"
+            return text
+
+        formatted: List[str] = []
         for page in pages:
-            title = page.title or "Untitled"
-            content = ""
-            if page.raw_data:
-                # Extract text content from raw_data if available
-                content = str(page.raw_data)[:2000]
-            formatted.append(f"### {title}\n{content}")
-        return "\n\n".join(formatted)
+            title = getattr(page, "title", None) or "Untitled"
+            page_id = getattr(page, "page_id", None) or ""
+            obj_type = (getattr(page, "object_type", None) or "page").lower()
+
+            header = f"### {title}\nID: {page_id}\nType: {obj_type}"
+            body = ""
+
+            if obj_type == "database":
+                schema = getattr(page, "schema_data", None) or {}
+                schema = schema if isinstance(schema, dict) else {}
+                cached_entries = schema.get("cached_entries")
+                cached_columns = schema.get("cached_columns")
+                cached_total = schema.get("cached_total")
+                cached_error = schema.get("cached_error")
+
+                if isinstance(cached_entries, list) and cached_entries:
+                    cols = cached_columns if isinstance(cached_columns, list) else []
+                    total = cached_total if isinstance(cached_total, int) else len(cached_entries)
+
+                    sample = cached_entries[:10]
+                    rows: List[str] = []
+                    for entry in sample:
+                        if not isinstance(entry, dict):
+                            continue
+                        props = entry.get("properties") if isinstance(entry.get("properties"), dict) else {}
+                        row_bits: List[str] = []
+                        for col in cols[:8]:
+                            val = props.get(col)
+                            if val is None or val == "":
+                                continue
+                            if isinstance(val, list):
+                                row_bits.append(f"{col}: {', '.join(str(x) for x in val[:3])}{'...' if len(val) > 3 else ''}")
+                            else:
+                                row_bits.append(f"{col}: {val}")
+                        row_line = "; ".join(row_bits) if row_bits else (entry.get("title") or entry.get("id") or "(row)")
+                        rows.append(f"- {row_line}")
+
+                    body = "\n".join(
+                        [
+                            f"Cached rows: {total}",
+                            "\n".join(rows),
+                        ]
+                    ).strip()
+                else:
+                    note = "Database rows not cached. Refresh this database (or its parent page) in Pipelines to persist entries into Supabase."
+                    if cached_error:
+                        note = f"{note}\nLast error: {cached_error}"
+                    body = note
+
+            else:
+                blocks = getattr(page, "blocks_data", None)
+                if isinstance(blocks, list) and blocks:
+                    flat = _flatten_block_tree(blocks)
+                    lines: List[str] = []
+                    budget = 3500
+                    used = 0
+                    for b in flat:
+                        line = _extract_block_line(b)
+                        if not line:
+                            continue
+                        if used + len(line) + 1 > budget:
+                            break
+                        lines.append(line)
+                        used += len(line) + 1
+                    body = "\n".join(lines).strip() or "(No readable text blocks found.)"
+                else:
+                    # Titles-only pipeline will populate title/metadata, but not blocks.
+                    body = "Page content not cached. Click Refresh on this page in Pipelines to fetch and persist blocks into Supabase."
+
+            formatted.append(f"{header}\n\n{body}")
+
+        return "\n\n---\n\n".join(formatted)
 
     async def _fetch_destination_state(
         self, output_config: Dict[str, Any], run_id: str
@@ -1120,6 +1836,15 @@ class WorkflowExecutionEngine:
         }
         
         try:
+            # First check if this ID is a database
+            db_resp = requests.get(
+                f"https://api.notion.com/v1/databases/{page_id}",
+                headers=headers,
+                timeout=30,
+            )
+            if db_resp.status_code == 200:
+                return self._fetch_notion_database_state(headers, page_id, db_resp.json())
+
             # First, get the page metadata
             page_resp = requests.get(
                 f"https://api.notion.com/v1/pages/{page_id}",
@@ -1133,10 +1858,13 @@ class WorkflowExecutionEngine:
             page_data = page_resp.json()
             object_type = page_data.get("object", "page")
             parent = page_data.get("parent", {})
-            
-            # Check if this is actually a database
-            if parent.get("type") == "database_id" or object_type == "database":
+
+            if object_type == "database":
                 return self._fetch_notion_database_state(headers, page_id, page_data)
+
+            # Database row page: show properties + parent schema (do NOT treat the row ID as a database)
+            if parent.get("type") == "database_id":
+                return self._fetch_notion_database_row_state(headers, page_data)
             
             # It's a regular page - get its content
             state_parts = []
@@ -1163,6 +1891,91 @@ class WorkflowExecutionEngine:
         except Exception as e:
             logger.error(f"Error fetching Notion page state: {e}", exc_info=True)
             return f"Error fetching page state: {e}"
+
+    def _fetch_notion_database_row_state(self, headers: Dict, page_data: Dict) -> str:
+        import requests
+
+        state_parts: List[str] = []
+        title = self._extract_notion_title(page_data)
+        state_parts.append(f"**Page Title:** {title}")
+        state_parts.append("**Type:** Database Row")
+
+        parent = page_data.get("parent", {}) or {}
+        db_id = parent.get("database_id")
+        if db_id:
+            state_parts.append(f"**Parent Database ID:** {db_id}")
+            try:
+                db_resp = requests.get(
+                    f"https://api.notion.com/v1/databases/{db_id}",
+                    headers=headers,
+                    timeout=30,
+                )
+                if db_resp.status_code == 200:
+                    db_data = db_resp.json() or {}
+                    db_title = self._extract_notion_title(db_data)
+                    state_parts.append(f"**Parent Database Title:** {db_title}")
+                    properties = db_data.get("properties", {}) or {}
+                    if properties:
+                        schema_lines = ["**Schema (Columns):**"]
+                        for prop_name, prop_def in properties.items():
+                            prop_type = (prop_def or {}).get("type", "unknown")
+                            schema_lines.append(f"  - {prop_name} ({prop_type})")
+                        state_parts.append("\n".join(schema_lines))
+            except Exception:
+                pass
+
+        # Current property values
+        props = page_data.get("properties", {}) or {}
+        if props:
+            lines = ["**Current Properties (Values):**"]
+            for prop_name, prop in props.items():
+                try:
+                    ptype = (prop or {}).get("type")
+                    val = None
+                    if ptype == "title":
+                        val = "".join(t.get("plain_text", "") for t in (prop.get("title") or []))
+                    elif ptype == "rich_text":
+                        val = "".join(t.get("plain_text", "") for t in (prop.get("rich_text") or []))
+                    elif ptype == "number":
+                        val = prop.get("number")
+                    elif ptype == "status":
+                        st = prop.get("status") or {}
+                        val = st.get("name")
+                    elif ptype == "select":
+                        st = prop.get("select") or {}
+                        val = st.get("name")
+                    elif ptype == "multi_select":
+                        val = [o.get("name") for o in (prop.get("multi_select") or []) if isinstance(o, dict)]
+                    elif ptype == "checkbox":
+                        val = prop.get("checkbox")
+                    elif ptype == "url":
+                        val = prop.get("url")
+                    elif ptype == "email":
+                        val = prop.get("email")
+                    elif ptype == "phone_number":
+                        val = prop.get("phone_number")
+                    elif ptype == "date":
+                        d = prop.get("date") or {}
+                        val = d.get("start")
+                    elif ptype == "people":
+                        val = [p.get("name") or p.get("id") for p in (prop.get("people") or []) if isinstance(p, dict)]
+                    else:
+                        val = f"<{ptype}>"
+
+                    if val is None or val == "" or val == []:
+                        disp = "<empty>"
+                    else:
+                        disp = str(val)
+                    lines.append(f"  - {prop_name}: {disp}")
+                except Exception:
+                    continue
+            state_parts.append("\n".join(lines))
+
+        state_parts.append(
+            "\n**Update guidance:** This destination is a database row. Prefer updating properties (Status / Next Step / values) using entry_id-based tools. Avoid replacing page content." 
+        )
+
+        return "\n".join(state_parts)
 
     def _fetch_notion_database_state(self, headers: Dict, database_id: str, db_data: Dict = None) -> str:
         """Fetch state of a Notion database including schema and sample rows."""
@@ -1772,13 +2585,27 @@ Please provide your response in {output_format} format."""
         outputs = output_config.get("outputs", [])
         results = []
 
+        def _looks_successful(details: Any) -> bool:
+            if details is None:
+                return False
+            if isinstance(details, str):
+                return details.strip().startswith("✅")
+            if isinstance(details, dict):
+                res = details.get("result")
+                if isinstance(res, str):
+                    return res.strip().startswith("✅")
+            return True
+
         for output in outputs:
             output_type = output.get("type")
             
             try:
                 if output_type == "notion_page":
                     result = await self._output_to_notion(ai_response, output, run_id)
-                    results.append({"type": "notion", "success": True, "details": result})
+                    ok = _looks_successful(result)
+                    if not ok:
+                        self._log(run_id, "error", f"Notion output failed: {result}")
+                    results.append({"type": "notion", "success": ok, "details": result})
                     
                 elif output_type == "slack_message":
                     result = await self._output_to_slack(ai_response, output, run_id)
@@ -1811,7 +2638,11 @@ Please provide your response in {output_format} format."""
     async def _output_to_notion(
         self, content: str, output_config: Dict[str, Any], run_id: str
     ) -> Dict[str, Any]:
-        """Create or append to a Notion page."""
+        """Create or append to a Notion page.
+        
+        IMPORTANT: This is a FALLBACK method called when the tool-calling agent
+        didn't already write to the destination. It should NOT dump raw AI thinking.
+        """
         from agent.langchain_tools import WorkforceTools
         import requests
         
@@ -1821,6 +2652,39 @@ Please provide your response in {output_format} format."""
         title = output_config.get("title", f"Workflow Output - {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
         output_prompt = (output_config.get("output_prompt") or "").strip()
+
+        # ----------------------------------------------------------------
+        # STRIP AI THINKING/PLANNING from content - users don't want this
+        # ----------------------------------------------------------------
+        def _clean_ai_response(text: str) -> str:
+            """Remove AI thinking/planning sections from response."""
+            if not text:
+                return ""
+            lines = text.split("\n")
+            clean_lines = []
+            skip_section = False
+            for line in lines:
+                lower = line.lower().strip()
+                # Skip known AI thinking headers
+                if lower.startswith("### thinking") or lower.startswith("## thinking"):
+                    skip_section = True
+                    continue
+                if lower.startswith("### actions_taken") or lower.startswith("## actions_taken"):
+                    skip_section = True
+                    continue
+                if lower.startswith("### actions") or lower.startswith("## actions"):
+                    skip_section = True
+                    continue
+                # Resume on new major section
+                if skip_section and (lower.startswith("### ") or lower.startswith("## ")) and "thinking" not in lower and "action" not in lower:
+                    skip_section = False
+                if not skip_section:
+                    clean_lines.append(line)
+            result = "\n".join(clean_lines).strip()
+            # If we stripped everything, return empty
+            return result
+
+        cleaned_content = _clean_ai_response(content)
 
         def _extract_row_name(text: str) -> Optional[str]:
             if not text:
@@ -1851,36 +2715,82 @@ Please provide your response in {output_format} format."""
                 except Exception:
                     is_database = False
 
+            # If the target is a database ROW page, do not rewrite body in deterministic fallback.
+            if (not is_database) and Config.NOTION_TOKEN:
+                try:
+                    headers = {
+                        "Authorization": f"Bearer {Config.NOTION_TOKEN}",
+                        "Notion-Version": "2022-06-28",
+                        "Content-Type": "application/json",
+                    }
+                    page_resp = requests.get(
+                        f"https://api.notion.com/v1/pages/{page_id}",
+                        headers=headers,
+                        timeout=20,
+                    )
+                    if page_resp.status_code == 200:
+                        parent = (page_resp.json() or {}).get("parent", {}) or {}
+                        if parent.get("type") == "database_id":
+                            self._log(
+                                run_id,
+                                "warning",
+                                "Notion destination is a database row page; deterministic fallback will not rewrite page body. Use entry_id property update tools.",
+                            )
+                            return {
+                                "page_id": page_id,
+                                "action": "skipped",
+                                "result": "❌ Target is a Notion database row. Fallback refuses to replace/append page body. Use entry_id property update tools.",
+                            }
+                except Exception:
+                    pass
+
             if is_database:
                 row_name = _extract_row_name(output_prompt)
-                if row_name:
+                if row_name and cleaned_content:
                     result = tools.update_notion_database_row_content(
                         database_id=page_id,
                         entry_name=row_name,
-                        content=content,
+                        content=cleaned_content,
                         mode=mode,
                     )
                     self._log(run_id, "info", f"Updated Notion database row '{row_name}' in {page_id}")
                     return {"database_id": page_id, "row": row_name, "action": "row_updated", "result": result}
 
+                # For databases without a row name, DON'T append raw text - that's not how databases work
                 self._log(
                     run_id,
                     "warning",
-                    "Notion output target is a database but no row name was provided; updating database page content instead.",
+                    "Notion target is a database - use update_notion_entry_by_name tool to update specific rows. Skipping raw text append.",
                 )
+                return {
+                    "database_id": page_id,
+                    "action": "skipped",
+                    "result": "❌ Cannot append raw text to a Notion database. Use targeted row updates instead.",
+                }
+
+            # Only append if we have meaningful cleaned content
+            if not cleaned_content:
+                self._log(run_id, "info", "No content to write after cleaning AI thinking sections")
+                return {"page_id": page_id, "action": "skipped", "result": "No meaningful content to write"}
 
             if mode == "append":
-                result = tools.append_to_notion_page(page_id=page_id, content=content)
+                result = tools.append_to_notion_page(page_id=page_id, content=cleaned_content)
                 self._log(run_id, "info", f"Appended to Notion page {page_id}")
                 return {"page_id": page_id, "action": "appended", "result": result}
 
         if page_id and mode == "replace":
-            result = tools.replace_notion_page_content(page_id=page_id, content=content)
+            if not cleaned_content:
+                self._log(run_id, "info", "No content to write after cleaning AI thinking sections")
+                return {"page_id": page_id, "action": "skipped", "result": "No meaningful content to write"}
+            result = tools.replace_notion_page_content(page_id=page_id, content=cleaned_content)
             self._log(run_id, "info", f"Replaced content in Notion page {page_id}")
             return {"page_id": page_id, "action": "replaced", "result": result}
 
-        # Create new page
-        result = tools.create_notion_page(title=title, content=content)
+        # Create new page - only if we have content
+        if not cleaned_content:
+            self._log(run_id, "info", "No content to write after cleaning AI thinking sections")
+            return {"action": "skipped", "result": "No meaningful content to write"}
+        result = tools.create_notion_page(title=title, content=cleaned_content)
         self._log(run_id, "info", f"Created Notion page: {title}")
         return {"title": title, "action": "created", "result": result}
 

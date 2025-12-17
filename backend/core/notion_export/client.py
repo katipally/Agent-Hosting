@@ -433,6 +433,70 @@ class NotionClient:
             logger.error(f"Error retrieving database {database_id}: {e}")
             return None
 
+    def search(
+        self,
+        query: str = "",
+        filter_type: Optional[str] = None,
+        max_results: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Search across Notion workspace for pages and/or databases.
+        
+        This is the general-purpose search method that can find both pages and databases.
+        
+        Args:
+            query: Search query text (can be empty to list all)
+            filter_type: Optional filter - "page" or "database" to filter results
+            max_results: Maximum number of results to return
+            
+        Returns:
+            List of matching page/database objects
+        """
+        import requests
+        
+        if not self.token:
+            return []
+        
+        results: List[Dict[str, Any]] = []
+        cursor: Optional[str] = None
+        
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Notion-Version": "2022-06-28",
+            "Content-Type": "application/json",
+        }
+        
+        try:
+            while len(results) < max_results:
+                payload: Dict[str, Any] = {"page_size": min(100, max_results - len(results))}
+                if query:
+                    payload["query"] = query
+                if filter_type in ("page", "database"):
+                    payload["filter"] = {"value": filter_type, "property": "object"}
+                if cursor:
+                    payload["start_cursor"] = cursor
+                
+                response = requests.post(
+                    "https://api.notion.com/v1/search",
+                    headers=headers,
+                    json=payload,
+                    timeout=30,
+                )
+                response.raise_for_status()
+                data = response.json()
+                batch = data.get("results", [])
+                results.extend(batch)
+                
+                if not data.get("has_more") or not data.get("next_cursor"):
+                    break
+                cursor = data.get("next_cursor")
+            
+            logger.info(f"Search found {len(results)} results for query='{query}' filter={filter_type}")
+            return results[:max_results]
+            
+        except Exception as e:
+            logger.error(f"Error in Notion search: {e}")
+            return []
+
     def search_databases(self, title: Optional[str] = None) -> List[Dict[str, Any]]:
         """Search for all databases in the workspace, optionally filtering by title.
         
@@ -461,11 +525,9 @@ class NotionClient:
         
         try:
             while True:
-                # Use direct API call - search without filter to get all, then filter locally
-                # The filter param has changed in newer API versions
                 payload: Dict[str, Any] = {"page_size": 100}
                 if title:
-                    payload["query"] = title  # Use query param for text search
+                    payload["query"] = title
                 if cursor:
                     payload["start_cursor"] = cursor
                 
@@ -480,10 +542,8 @@ class NotionClient:
                 results = data.get("results", [])
                 
                 for item in results:
-                    # Filter to only databases
                     if item.get("object") == "database":
                         if title:
-                            # Match by title
                             db_title_parts = item.get("title", [])
                             db_title = "".join(t.get("plain_text", "") for t in db_title_parts)
                             if title.lower() in db_title.lower():
@@ -830,6 +890,287 @@ class NotionClient:
         if prop_type == "phone_number":
             return {"phone_number": str(value) if value else None}
 
+        # People: expects list of user IDs
+        if prop_type == "people":
+            if isinstance(value, list):
+                return {"people": [{"id": str(uid)} for uid in value if uid]}
+            elif value:
+                return {"people": [{"id": str(value)}]}
+            return {"people": []}
+
+        # Relation: expects list of page IDs
+        if prop_type == "relation":
+            if isinstance(value, list):
+                return {"relation": [{"id": str(pid)} for pid in value if pid]}
+            elif value:
+                return {"relation": [{"id": str(value)}]}
+            return {"relation": []}
+
+        # Files: expects list of external URLs or file objects
+        if prop_type == "files":
+            files_list = []
+            items = value if isinstance(value, list) else [value] if value else []
+            for item in items:
+                if isinstance(item, dict):
+                    # Already formatted file object
+                    files_list.append(item)
+                elif isinstance(item, str):
+                    # URL string - create external file object
+                    name = item.split("/")[-1][:100] or "file"
+                    files_list.append({
+                        "name": name,
+                        "type": "external",
+                        "external": {"url": item}
+                    })
+            return {"files": files_list}
+
         # For unsupported types, return empty dict
         logger.warning(f"Property type {prop_type} not supported for updates")
         return {}
+
+    def update_database_schema(
+        self,
+        database_id: str,
+        properties_updates: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Update database schema (add/rename/remove columns).
+        
+        Args:
+            database_id: The database ID to update
+            properties_updates: Dict of property updates:
+                - To add: {"New Column": {"type": "rich_text", ...}}
+                - To rename: {"Old Name": {"name": "New Name"}}
+                - To remove: {"Column Name": None}
+        
+        Returns:
+            Updated database object or None on error
+        """
+        import requests
+        
+        if not self.token:
+            logger.error("Notion token not configured")
+            return None
+
+        try:
+            response = requests.patch(
+                f"https://api.notion.com/v1/databases/{database_id}",
+                headers={
+                    "Authorization": f"Bearer {self.token}",
+                    "Notion-Version": "2022-06-28",
+                    "Content-Type": "application/json",
+                },
+                json={"properties": properties_updates},
+                timeout=30,
+            )
+            
+            if response.status_code == 200:
+                logger.info(f"Updated database schema {database_id}")
+                return response.json()
+            else:
+                logger.error(f"Error updating database schema: {response.status_code} - {response.text[:200]}")
+                return None
+        except Exception as e:
+            logger.error(f"Error updating database schema {database_id}: {e}", exc_info=True)
+            return None
+
+    def update_block(
+        self,
+        block_id: str,
+        block_type: str,
+        block_data: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Update a block's content.
+        
+        Args:
+            block_id: The block ID to update
+            block_type: Block type (paragraph, to_do, heading_1, etc.)
+            block_data: Block-specific data to update
+        
+        Returns:
+            Updated block object or None on error
+        """
+        import requests
+        
+        if not self.token:
+            logger.error("Notion token not configured")
+            return None
+
+        try:
+            response = requests.patch(
+                f"https://api.notion.com/v1/blocks/{block_id}",
+                headers={
+                    "Authorization": f"Bearer {self.token}",
+                    "Notion-Version": "2022-06-28",
+                    "Content-Type": "application/json",
+                },
+                json={block_type: block_data},
+                timeout=30,
+            )
+            
+            if response.status_code == 200:
+                logger.info(f"Updated block {block_id}")
+                return response.json()
+            else:
+                logger.error(f"Error updating block: {response.status_code} - {response.text[:200]}")
+                return None
+        except Exception as e:
+            logger.error(f"Error updating block {block_id}: {e}", exc_info=True)
+            return None
+
+    def update_todo_checked(self, block_id: str, checked: bool) -> Optional[Dict[str, Any]]:
+        """Update a to_do block's checked status.
+        
+        Args:
+            block_id: The to_do block ID
+            checked: Whether the to_do should be checked
+        
+        Returns:
+            Updated block object or None on error
+        """
+        return self.update_block(block_id, "to_do", {"checked": checked})
+
+    def get_block(self, block_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve a single block by ID.
+        
+        Args:
+            block_id: The block ID to retrieve
+        
+        Returns:
+            Block object or None on error
+        """
+        import requests
+        
+        if not self.token:
+            logger.error("Notion token not configured")
+            return None
+
+        try:
+            response = requests.get(
+                f"https://api.notion.com/v1/blocks/{block_id}",
+                headers={
+                    "Authorization": f"Bearer {self.token}",
+                    "Notion-Version": "2022-06-28",
+                },
+                timeout=30,
+            )
+            
+            if response.status_code == 200:
+                return response.json()
+            else:
+                logger.error(f"Error retrieving block: {response.status_code}")
+                return None
+        except Exception as e:
+            logger.error(f"Error retrieving block {block_id}: {e}", exc_info=True)
+            return None
+
+    def get_block_children(
+        self,
+        block_id: str,
+        max_depth: int = 3,
+    ) -> List[Dict[str, Any]]:
+        """Recursively fetch all block children with their IDs.
+        
+        Args:
+            block_id: Parent block/page ID
+            max_depth: Maximum recursion depth
+        
+        Returns:
+            List of block objects with nested _children
+        """
+        import requests
+        import time
+        
+        if not self.token:
+            return []
+
+        def fetch_children(parent_id: str, depth: int) -> List[Dict[str, Any]]:
+            if depth > max_depth:
+                return []
+            
+            blocks: List[Dict[str, Any]] = []
+            cursor: Optional[str] = None
+            
+            while True:
+                time.sleep(0.35)  # Rate limiting
+                params: Dict[str, Any] = {"page_size": 100}
+                if cursor:
+                    params["start_cursor"] = cursor
+                
+                try:
+                    resp = requests.get(
+                        f"https://api.notion.com/v1/blocks/{parent_id}/children",
+                        headers={
+                            "Authorization": f"Bearer {self.token}",
+                            "Notion-Version": "2022-06-28",
+                        },
+                        params=params,
+                        timeout=30,
+                    )
+                    if resp.status_code != 200:
+                        break
+                    
+                    data = resp.json()
+                    results = data.get("results", []) or []
+                    
+                    for block in results:
+                        block_copy = dict(block)
+                        blocks.append(block_copy)
+                        if block.get("has_children"):
+                            block_copy["_children"] = fetch_children(block.get("id"), depth + 1)
+                    
+                    if not data.get("has_more"):
+                        break
+                    cursor = data.get("next_cursor")
+                except Exception as e:
+                    logger.warning(f"Error fetching block children for {parent_id}: {e}")
+                    break
+            
+            return blocks
+        
+        return fetch_children(block_id, 0)
+
+    def create_database_entry(
+        self,
+        database_id: str,
+        properties: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Create a new entry (row) in a Notion database.
+        
+        Args:
+            database_id: The database ID to add entry to
+            properties: Dict of property name -> Notion API property object
+        
+        Returns:
+            Created page object or None on error
+        """
+        import requests
+        
+        if not self.token:
+            logger.error("Notion token not configured")
+            return None
+
+        try:
+            response = requests.post(
+                "https://api.notion.com/v1/pages",
+                headers={
+                    "Authorization": f"Bearer {self.token}",
+                    "Notion-Version": "2022-06-28",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "parent": {"database_id": database_id},
+                    "properties": properties,
+                },
+                timeout=30,
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                logger.info(f"Created database entry in {database_id}: {result.get('id')}")
+                return result
+            else:
+                logger.error(f"Error creating database entry: {response.status_code} - {response.text[:200]}")
+                return None
+        except Exception as e:
+            logger.error(f"Error creating database entry in {database_id}: {e}", exc_info=True)
+            return None

@@ -81,6 +81,8 @@ interface NotionPageContentState {
   attachments?: { id?: string; type: string; name?: string; url?: string | null }[]
   loading?: boolean
   error?: string | null
+  message?: string | null
+  cached?: boolean
   isDatabase?: boolean
   database?: DatabaseData
   childDatabases?: DatabaseData[]
@@ -785,7 +787,7 @@ export default function PipelinesInterface() {
       setNotionIsRunning(true)
       setNotionRunStatus('starting')
 
-      const response = await fetch(`${API_BASE_URL}/api/pipelines/notion/run`, {
+      const response = await fetch(`${API_BASE_URL}/api/pipelines/notion/run?mode=titles`, {
         method: 'POST',
         credentials: 'include',
       })
@@ -798,7 +800,6 @@ export default function PipelinesInterface() {
       const newRunId = data.run_id as string
       setNotionRunId(newRunId)
       setNotionRunStatus(data.status || 'started')
-      setNotionPages([])
 
       pollNotionRunStatus(newRunId)
     } catch (err: any) {
@@ -910,13 +911,14 @@ export default function PipelinesInterface() {
           ...existing,
           loading: true,
           error: null,
+          message: null,
         },
       }
     })
 
     try {
       const response = await fetch(
-        `${API_BASE_URL}/api/notion/page-content?page_id=${encodeURIComponent(pageId)}&include_databases=true`,
+        `${API_BASE_URL}/api/notion/page-content?page_id=${encodeURIComponent(pageId)}&include_databases=true&cache_only=true`,
         {
           credentials: 'include',
         },
@@ -932,6 +934,8 @@ export default function PipelinesInterface() {
           attachments: data.attachments || [],
           loading: false,
           error: null,
+          message: data.message || null,
+          cached: Boolean(data.cached),
           isDatabase: data.is_database || false,
           database: data.database || null,
           childDatabases: data.child_databases || [],
@@ -945,6 +949,62 @@ export default function PipelinesInterface() {
           ...(prev[pageId] || {}),
           loading: false,
           error: err.message || 'Failed to load Notion page content',
+        },
+      }))
+    }
+  }
+
+  const refreshNotionPageContent = async (pageId: string) => {
+    setNotionPageContent((prev) => {
+      const existing = prev[pageId]
+      if (existing?.loading) {
+        return prev
+      }
+      return {
+        ...prev,
+        [pageId]: {
+          ...existing,
+          loading: true,
+          error: null,
+          message: null,
+        },
+      }
+    })
+
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/notion/page-content?page_id=${encodeURIComponent(pageId)}&include_databases=true&refresh=true`,
+        {
+          credentials: 'include',
+        },
+      )
+      if (!response.ok) {
+        throw new Error(`Failed to refresh Notion page content: ${response.status}`)
+      }
+      const data = await response.json()
+      setNotionPageContent((prev) => ({
+        ...prev,
+        [pageId]: {
+          content: data.content || '',
+          attachments: data.attachments || [],
+          loading: false,
+          error: null,
+          message: null,
+          cached: true,
+          isDatabase: data.is_database || false,
+          database: data.database || null,
+          childDatabases: data.child_databases || [],
+        },
+      }))
+      await fetchNotionHierarchy()
+    } catch (err: any) {
+      console.error('Error refreshing Notion page content:', err)
+      setNotionPageContent((prev) => ({
+        ...prev,
+        [pageId]: {
+          ...(prev[pageId] || {}),
+          loading: false,
+          error: err.message || 'Failed to refresh Notion page content',
         },
       }))
     }
@@ -1531,18 +1591,36 @@ export default function PipelinesInterface() {
           </span>
         </summary>
         <div className="px-3 py-2 border-t border-border/40 text-xs text-foreground space-y-2">
-          {page.url && (
-            <div className="flex items-center justify-between gap-2">
-              <span className="text-[11px] text-muted-foreground break-all">ID: {page.id}</span>
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-[11px] text-muted-foreground break-all">ID: {page.id}</span>
+            <div className="flex items-center gap-2">
               <button
                 type="button"
-                onClick={() => window.open(page.url as string, '_blank')}
-                className="text-[11px] font-medium text-blue-400 hover:underline"
+                onClick={(e) => {
+                  e.preventDefault()
+                  e.stopPropagation()
+                  refreshNotionPageContent(page.id)
+                }}
+                disabled={Boolean(contentState?.loading)}
+                className="inline-flex items-center justify-center rounded-md bg-blue-600 px-2 py-1 text-[11px] font-medium text-white shadow-sm hover:bg-blue-700 disabled:opacity-60 disabled:cursor-not-allowed"
               >
-                Open in Notion
+                {contentState?.loading ? 'Refreshing…' : 'Refresh'}
               </button>
+              {page.url && (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.preventDefault()
+                    e.stopPropagation()
+                    window.open(page.url as string, '_blank')
+                  }}
+                  className="text-[11px] font-medium text-blue-400 hover:underline"
+                >
+                  Open in Notion
+                </button>
+              )}
             </div>
-          )}
+          </div>
           {/* Only show Properties for regular pages, not for databases */}
           {hasProps && !contentState?.isDatabase && (
             <div>
@@ -1564,6 +1642,9 @@ export default function PipelinesInterface() {
           )}
           {!contentState?.loading && contentState?.error && (
             <p className="text-[11px] text-red-400">Failed to load content: {contentState.error}</p>
+          )}
+          {!contentState?.loading && !contentState?.error && contentState?.message && (
+            <p className="text-[11px] text-muted-foreground">{contentState.message}</p>
           )}
           {/* Show database content as table */}
           {!contentState?.loading && contentState?.isDatabase && contentState?.database && (
@@ -1748,7 +1829,7 @@ export default function PipelinesInterface() {
                 disabled={notionIsRunning}
                 className="inline-flex items-center justify-center rounded-md bg-blue-600 px-3 py-1.5 text-sm font-medium text-white shadow-sm hover:bg-blue-700 disabled:opacity-60 disabled:cursor-not-allowed"
               >
-                {notionIsRunning ? 'Running…' : 'Run Notion Pipeline'}
+                {notionIsRunning ? 'Refreshing…' : 'Refresh titles'}
               </button>
               {notionIsRunning && notionRunId && (
                 <button
@@ -1790,6 +1871,14 @@ export default function PipelinesInterface() {
               placeholder="Filter pages by title"
               className="flex-1 rounded-md border border-border bg-background px-2 py-1 text-xs"
             />
+            <button
+              type="button"
+              onClick={handleRunNotionPipeline}
+              disabled={notionIsRunning}
+              className="inline-flex items-center justify-center rounded-md bg-blue-600 px-2.5 py-1.5 text-xs font-medium text-white shadow-sm hover:bg-blue-700 disabled:opacity-60 disabled:cursor-not-allowed"
+            >
+              {notionIsRunning ? 'Refreshing…' : 'Refresh titles'}
+            </button>
             <span className="text-[11px] text-muted-foreground">{filteredPages.length} pages</span>
           </div>
           <div className="flex-1 overflow-auto border border-border rounded-md bg-card p-2">
