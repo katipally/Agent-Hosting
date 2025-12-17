@@ -4939,27 +4939,30 @@ def _run_gmail_pipeline(run_id: str, label_id: str, user_id: str) -> None:
 
     logger.info("Starting Gmail pipeline run %s for label %s (user_id=%s)", run_id, label_id, user_id)
 
-    run_info = gmail_pipeline_runs.get(run_id) or {}
-    gmail_pipeline_runs[run_id] = run_info
-    run_info.setdefault("cancel_requested", False)
-    run_info["status"] = "running"
-    run_info["started_at"] = datetime.utcnow().isoformat()
-    run_info["label_id"] = label_id
-    run_info["user_id"] = user_id
+    run_stats: Dict[str, Any] = {"label_id": label_id}
+    _update_pipeline_run(run_id, status="running", started_at=datetime.utcnow(), stats=run_stats)
 
     creds = _build_google_credentials_for_user_id(user_id)
     if not creds:
-        run_info["status"] = "failed"
-        run_info["finished_at"] = datetime.utcnow().isoformat()
-        run_info["error"] = "Gmail not authorized for user"
+        _update_pipeline_run(
+            run_id,
+            status="failed",
+            finished_at=datetime.utcnow(),
+            error="Gmail not authorized for user",
+            stats=run_stats,
+        )
         logger.error("No valid Gmail credentials for user %s in pipeline run %s", user_id, run_id)
         return
 
     client = GmailClient()
     if not client.init_with_credentials(creds):
-        run_info["status"] = "failed"
-        run_info["finished_at"] = datetime.utcnow().isoformat()
-        run_info["error"] = "Gmail authentication failed"
+        _update_pipeline_run(
+            run_id,
+            status="failed",
+            finished_at=datetime.utcnow(),
+            error="Gmail authentication failed",
+            stats=run_stats,
+        )
         logger.error("Gmail authentication failed for pipeline run %s", run_id)
         return
 
@@ -5008,12 +5011,15 @@ def _run_gmail_pipeline(run_id: str, label_id: str, user_id: str) -> None:
         with db_manager.get_session() as session:
             while not stop and processed_new < max_new_messages:
                 # Cooperative cancellation support
-                if run_info.get("cancel_requested"):
+                if _is_cancel_requested(run_id):
                     session.commit()
-                    run_info["status"] = "cancelled"
-                    run_info["finished_at"] = datetime.utcnow().isoformat()
-                    run_info["message_count"] = len(messages)
-                    gmail_run_messages[run_id] = messages
+                    run_stats["message_count"] = len(messages)
+                    _update_pipeline_run(
+                        run_id,
+                        status="cancelled",
+                        finished_at=datetime.utcnow(),
+                        stats=run_stats,
+                    )
                     logger.info("Gmail pipeline run %s cancelled", run_id)
                     return
 
@@ -5186,9 +5192,13 @@ def _run_gmail_pipeline(run_id: str, label_id: str, user_id: str) -> None:
             session.commit()
 
         gmail_run_messages[run_id] = messages
-        run_info["status"] = "completed"
-        run_info["finished_at"] = datetime.utcnow().isoformat()
-        run_info["message_count"] = len(messages)
+        run_stats["message_count"] = len(messages)
+        _update_pipeline_run(
+            run_id,
+            status="completed",
+            finished_at=datetime.utcnow(),
+            stats=run_stats,
+        )
 
         if newest_ts_ms > last_ts_ms:
             if account_email:
@@ -5217,17 +5227,24 @@ def _run_gmail_pipeline(run_id: str, label_id: str, user_id: str) -> None:
                     source_ids=[label_id],
                     db_manager=db_manager
                 )
-                run_info["embedding_stats"] = embed_stats
+                run_stats["embedding_stats"] = embed_stats
+                _update_pipeline_run(run_id, stats=run_stats)
                 logger.info("✓ Gmail embeddings synced: %s", embed_stats)
             except Exception as embed_error:
                 logger.error(f"Embedding sync failed (non-fatal): {embed_error}")
-                run_info["embedding_error"] = str(embed_error)
+                run_stats["embedding_error"] = str(embed_error)
+                _update_pipeline_run(run_id, stats=run_stats)
 
     except Exception as e:  # pragma: no cover - defensive logging
         logger.error(f"Gmail pipeline run {run_id} failed: {e}", exc_info=True)
-        run_info["status"] = "failed"
-        run_info["finished_at"] = datetime.utcnow().isoformat()
-        run_info["error"] = str(e)
+        run_stats["error"] = str(e)
+        _update_pipeline_run(
+            run_id,
+            status="failed",
+            finished_at=datetime.utcnow(),
+            error=str(e),
+            stats=run_stats,
+        )
 
 
 @app.get("/api/pipelines/gmail/labels")
@@ -5282,14 +5299,16 @@ async def run_gmail_pipeline(label_id: str, current_user: AppUser = Depends(get_
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Gmail not authorized")
 
     run_id = uuid.uuid4().hex
-    gmail_pipeline_runs[run_id] = {
-        "run_id": run_id,
-        "label_id": label_id,
-        "user_id": current_user.id,
-        "status": "pending",
-        "created_at": datetime.utcnow().isoformat(),
-        "cancel_requested": False,
-    }
+
+    with db_manager.get_session() as session:
+        pipeline_run = PipelineRun(
+            run_id=run_id,
+            pipeline_type="gmail",
+            status="pending",
+            config={"label_id": label_id, "user_id": current_user.id},
+        )
+        session.add(pipeline_run)
+        session.commit()
 
     thread = threading.Thread(target=_run_gmail_pipeline, args=(run_id, label_id, current_user.id), daemon=True)
     thread.start()
@@ -5301,10 +5320,15 @@ async def run_gmail_pipeline(label_id: str, current_user: AppUser = Depends(get_
 async def get_gmail_pipeline_status(run_id: str, current_user: AppUser = Depends(get_current_user)):
     """Get the status of a Gmail pipeline run."""
 
-    run = gmail_pipeline_runs.get(run_id)
-    if not run or run.get("user_id") != current_user.id:
+    run = _get_pipeline_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    cfg = run.get("config") or {}
+    if cfg.get("user_id") != current_user.id:
         # Hide existence of other users' runs
         raise HTTPException(status_code=404, detail="Run not found")
+
     return run
 
 
@@ -5312,26 +5336,36 @@ async def get_gmail_pipeline_status(run_id: str, current_user: AppUser = Depends
 async def stop_gmail_pipeline(run_id: str, current_user: AppUser = Depends(get_current_user)):
     """Request cancellation of a Gmail pipeline run."""
 
-    run = gmail_pipeline_runs.get(run_id)
-    if not run or run.get("user_id") != current_user.id:
+    run = _get_pipeline_run(run_id)
+    if not run:
         raise HTTPException(status_code=404, detail="Run not found")
 
-    run["cancel_requested"] = True
+    cfg = run.get("config") or {}
+    if cfg.get("user_id") != current_user.id:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    updates: Dict[str, Any] = {"cancel_requested": True}
     if run.get("status") in ("pending", "running"):
-        run["status"] = "cancelling"
-    run["finished_at"] = datetime.utcnow().isoformat()
-    return run
+        updates["status"] = "cancelling"
+    _update_pipeline_run(run_id, **updates)
+
+    refreshed = _get_pipeline_run(run_id)
+    return refreshed or {"run_id": run_id, "status": "cancelling"}
 
 
 @app.get("/api/pipelines/gmail/messages")
 async def get_gmail_pipeline_messages(run_id: str, current_user: AppUser = Depends(get_current_user)):
     """Return messages for a specific Gmail pipeline run."""
 
-    run = gmail_pipeline_runs.get(run_id)
+    run = _get_pipeline_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
 
-    label_id = run.get("label_id")
+    cfg = run.get("config") or {}
+    if cfg.get("user_id") != current_user.id:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    label_id = cfg.get("label_id")
 
     # Always prefer DB-backed messages when available, but fall back to the
     # in-memory run results so the user sees emails immediately after a run
