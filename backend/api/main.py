@@ -3636,7 +3636,13 @@ Project context from synced sources:
             logger.error(f"Error in streaming project chat for {project_id}: {e}", exc_info=True)
             yield json.dumps({"type": "error", "content": str(e)}) + "\n"
 
-    return StreamingResponse(_gen(), media_type="application/x-ndjson")
+    # Headers to prevent nginx/proxy buffering which breaks streaming
+    headers = {
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",  # Disables nginx buffering
+        "Connection": "keep-alive",
+    }
+    return StreamingResponse(_gen(), media_type="application/x-ndjson", headers=headers)
 
 
 @app.get("/api/projects/{project_id}/chat/history")
